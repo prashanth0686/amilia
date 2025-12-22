@@ -25,6 +25,8 @@ app.post("/book", async (req, res) => {
   const {
     BROWSERLESS_HTTP_BASE,
     BROWSERLESS_TOKEN,
+    AMILIA_EMAIL,
+    AMILIA_PASSWORD,
   } = process.env;
 
   if (!BROWSERLESS_HTTP_BASE || !BROWSERLESS_TOKEN) {
@@ -37,46 +39,103 @@ app.post("/book", async (req, res) => {
     });
   }
 
-  // Browserless Function API runs Puppeteer-compatible code via HTTP
-  // Docs: POST /function?token=...  Content-Type: application/javascript or application/json
-  // We'll use JSON mode (easier/safer quoting).
-  // https://docs.browserless.io/rest-apis/function :contentReference[oaicite:2]{index=2}
+  if (!AMILIA_EMAIL || !AMILIA_PASSWORD) {
+    return res.status(500).json({
+      error: "Amilia credentials not configured",
+      missing: {
+        AMILIA_EMAIL: !AMILIA_EMAIL,
+        AMILIA_PASSWORD: !AMILIA_PASSWORD,
+      },
+    });
+  }
+
   const functionUrl = `${BROWSERLESS_HTTP_BASE.replace(/\/$/, "")}/function?token=${encodeURIComponent(
     BROWSERLESS_TOKEN
   )}`;
 
-  // Minimal “prove it works” script:
-  // - open example.com
-  // - return page title
+  // IMPORTANT: Browserless Function is Puppeteer-compatible, not Playwright.
+  // So we avoid Playwright-only selectors like :has-text().
   const code = `
-    export default async function ({ page }) {
-      await page.goto("https://example.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
-      const title = await page.title();
-      return {
-        data: { ok: true, title },
-        type: "application/json",
-      };
+  export default async function ({ page, context }) {
+    const { EMAIL, PASSWORD } = context;
+
+    // Faster/more stable defaults
+    page.setDefaultTimeout(30000);
+
+    // 1) Go directly to Amilia login
+    await page.goto("https://app.amilia.com/en/login", {
+      waitUntil: "domcontentloaded",
+      timeout: 60000
+    });
+
+    // 2) Fill email/password (generic selectors)
+    const emailSel = 'input[type="email"], input[name*="email" i]';
+    const passSel  = 'input[type="password"], input[name*="password" i]';
+
+    await page.waitForSelector(emailSel);
+    await page.type(emailSel, EMAIL, { delay: 10 });
+
+    await page.waitForSelector(passSel);
+    await page.type(passSel, PASSWORD, { delay: 10 });
+
+    // 3) Submit by clicking the submit button OR pressing Enter
+    const submitSel = 'button[type="submit"], input[type="submit"]';
+    const submit = await page.$(submitSel);
+    if (submit) {
+      await submit.click();
+    } else {
+      // fallback: press Enter in password field
+      await page.focus(passSel);
+      await page.keyboard.press("Enter");
     }
+
+    // 4) Wait for login to complete
+    // We don't assume a full navigation (some apps are SPA).
+    // We'll wait for either:
+    // - URL not containing /login
+    // - OR network idle (some requests finish)
+    await page.waitForFunction(() => !location.href.includes("/login"), { timeout: 60000 })
+      .catch(async () => {
+        await page.waitForNetworkIdle({ idleTime: 1000, timeout: 60000 }).catch(() => {});
+      });
+
+    // 5) Open badminton search
+    const searchUrl = "https://app.amilia.com/store/en/ville-de-quebec1/api/Activity/Search?textCriteria=badminton";
+    await page.goto(searchUrl, { waitUntil: "networkidle", timeout: 60000 });
+
+    // 6) Return debug info
+    const bodyText = await page.evaluate(() => document.body?.innerText || "");
+    return {
+      data: {
+        status: "LOGGED_IN_AND_SEARCH_LOADED",
+        url: page.url(),
+        pageLength: bodyText.length
+      },
+      type: "application/json"
+    };
+  }
   `.trim();
 
-  // Optional timeout control on our side
   const controller = new AbortController();
-  const timeoutMs = 60000;
+  const timeoutMs = 120000; // allow time for login + navigation
   const t = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const resp = await fetch(functionUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       signal: controller.signal,
-      body: JSON.stringify({ code }),
+      body: JSON.stringify({
+        code,
+        context: {
+          EMAIL: AMILIA_EMAIL,
+          PASSWORD: AMILIA_PASSWORD,
+        },
+      }),
     });
 
     const text = await resp.text();
 
-    // Browserless should return JSON for our script, but if something fails we’ll still show raw text.
     let parsed;
     try {
       parsed = JSON.parse(text);
