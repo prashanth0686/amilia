@@ -19,7 +19,15 @@ function requireApiKey(req, res) {
   return true;
 }
 
-const VALID_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const VALID_DAYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
 
 function isValidHHMM(v) {
   // Accepts "H:MM" or "HH:MM"
@@ -61,14 +69,21 @@ app.post("/book", async (req, res) => {
   const DEFAULT_EVENING_START = process.env.EVENING_START || "17:00";
   const DEFAULT_EVENING_END = process.env.EVENING_END || "22:00";
   const DEFAULT_TIMEZONE = process.env.LOCAL_TZ || "America/Toronto";
+  const DEFAULT_ACTIVITY_URL =
+    process.env.ACTIVITY_URL ||
+    "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6112282?scrollToCalendar=true&view=month";
 
   // === OVERRIDES (from request body) ===
-  // Allows n8n / PowerShell to set a different day/time window without redeploy
+  // Allows n8n / PowerShell to set a different day/time window/activity without redeploy
   const body = req.body || {};
   const targetDay = body.targetDay || DEFAULT_TARGET_DAY;
   const eveningStart = body.eveningStart || DEFAULT_EVENING_START;
   const eveningEnd = body.eveningEnd || DEFAULT_EVENING_END;
   const timeZone = body.timeZone || DEFAULT_TIMEZONE;
+  const activityUrl = body.activityUrl || DEFAULT_ACTIVITY_URL;
+
+  // Build rule object (requested format)
+  const rule = { targetDay, eveningStart, eveningEnd, timeZone, activityUrl };
 
   // Validate overrides
   if (!VALID_DAYS.includes(targetDay)) {
@@ -78,6 +93,7 @@ app.post("/book", async (req, res) => {
       allowed: VALID_DAYS,
     });
   }
+
   if (!isValidHHMM(eveningStart) || !isValidHHMM(eveningEnd)) {
     return res.status(400).json({
       error: "Invalid eveningStart/eveningEnd (expected HH:MM)",
@@ -86,15 +102,32 @@ app.post("/book", async (req, res) => {
     });
   }
 
-  const functionUrl = `${BROWSERLESS_HTTP_BASE.replace(/\/$/, "")}/function?token=${encodeURIComponent(
-    BROWSERLESS_TOKEN
-  )}`;
+  if (typeof activityUrl !== "string" || !activityUrl.includes("/shop/activities/")) {
+    return res.status(400).json({
+      error: "Invalid activityUrl (must include /shop/activities/)",
+      provided: activityUrl,
+      example:
+        "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6112282?scrollToCalendar=true&view=month",
+    });
+  }
+
+  const functionUrl = `${BROWSERLESS_HTTP_BASE.replace(
+    /\/$/,
+    ""
+  )}/function?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
 
   // IMPORTANT: Browserless Function is Puppeteer-compatible, not Playwright.
-  // So avoid Playwright-only selectors like :has-text().
   const code = `
   export default async function ({ page, context }) {
-    const { EMAIL, PASSWORD, TARGET_DAY, EVENING_START, EVENING_END, TIME_ZONE } = context;
+    const {
+      EMAIL,
+      PASSWORD,
+      TARGET_DAY,
+      EVENING_START,
+      EVENING_END,
+      TIME_ZONE,
+      ACTIVITY_URL
+    } = context;
 
     page.setDefaultTimeout(30000);
 
@@ -137,30 +170,28 @@ app.post("/book", async (req, res) => {
       { timeout: 60000 }
     ).catch(() => {});
 
-    // 5) Go to badminton search
-    const searchUrl =
-      "https://app.amilia.com/store/en/ville-de-quebec1/api/Activity/Search?textCriteria=badminton";
-
-    await page.goto(searchUrl, {
+    // 5) Go to your activity calendar page (where slots show after clicking "Register for drop-in")
+    await page.goto(ACTIVITY_URL, {
       waitUntil: "networkidle2",
       timeout: 60000
     });
 
-    // 6) Return debug info (Phase 1 complete), plus your selected rule values
+    // 6) Return debug info (Phase 1 complete), plus rule values
     const bodyText = await page.evaluate(() => document.body?.innerText || "");
 
     return {
       data: {
-        status: "LOGGED_IN_AND_SEARCH_LOADED",
+        status: "LOGGED_IN_AND_ACTIVITY_PAGE_LOADED",
         url: page.url(),
         pageLength: bodyText.length,
 
-        // Rule config that was applied (so you can confirm overrides worked)
+        // Rule config that was applied (confirms overrides worked)
         rule: {
           targetDay: TARGET_DAY,
           eveningStart: EVENING_START,
           eveningEnd: EVENING_END,
           timeZone: TIME_ZONE,
+          activityUrl: ACTIVITY_URL,
           eveningStartMin: hhmmToMinutes(EVENING_START),
           eveningEndMin: hhmmToMinutes(EVENING_END)
         }
@@ -171,7 +202,7 @@ app.post("/book", async (req, res) => {
 `.trim();
 
   const controller = new AbortController();
-  const timeoutMs = 120000; // allow time for login + navigation
+  const timeoutMs = 180000; // allow time for login + navigation
   const t = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
@@ -190,6 +221,7 @@ app.post("/book", async (req, res) => {
           EVENING_START: eveningStart,
           EVENING_END: eveningEnd,
           TIME_ZONE: timeZone,
+          ACTIVITY_URL: activityUrl,
         },
       }),
     });
@@ -213,12 +245,15 @@ app.post("/book", async (req, res) => {
 
     return res.json({
       status: "BROWSERLESS_HTTP_OK",
+      rule,
       browserless: parsed,
     });
   } catch (err) {
     const isAbort = err?.name === "AbortError";
     return res.status(504).json({
-      error: isAbort ? "Browserless HTTP request timed out" : "Browserless HTTP request failed",
+      error: isAbort
+        ? "Browserless HTTP request timed out"
+        : "Browserless HTTP request failed",
       details: String(err?.message || err),
     });
   } finally {
