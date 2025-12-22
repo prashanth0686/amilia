@@ -19,6 +19,13 @@ function requireApiKey(req, res) {
   return true;
 }
 
+const VALID_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function isValidHHMM(v) {
+  // Accepts "H:MM" or "HH:MM"
+  return /^([01]?\d|2[0-3]):[0-5]\d$/.test(v || "");
+}
+
 app.post("/book", async (req, res) => {
   if (!requireApiKey(req, res)) return;
 
@@ -28,9 +35,6 @@ app.post("/book", async (req, res) => {
     AMILIA_EMAIL,
     AMILIA_PASSWORD,
   } = process.env;
-
-  // ...
-
 
   if (!BROWSERLESS_HTTP_BASE || !BROWSERLESS_TOKEN) {
     return res.status(500).json({
@@ -52,17 +56,54 @@ app.post("/book", async (req, res) => {
     });
   }
 
+  // === DEFAULTS (from Cloud Run env vars) ===
+  const DEFAULT_TARGET_DAY = process.env.TARGET_DAY || "Saturday";
+  const DEFAULT_EVENING_START = process.env.EVENING_START || "17:00";
+  const DEFAULT_EVENING_END = process.env.EVENING_END || "22:00";
+  const DEFAULT_TIMEZONE = process.env.LOCAL_TZ || "America/Toronto";
+
+  // === OVERRIDES (from request body) ===
+  // Allows n8n / PowerShell to set a different day/time window without redeploy
+  const body = req.body || {};
+  const targetDay = body.targetDay || DEFAULT_TARGET_DAY;
+  const eveningStart = body.eveningStart || DEFAULT_EVENING_START;
+  const eveningEnd = body.eveningEnd || DEFAULT_EVENING_END;
+  const timeZone = body.timeZone || DEFAULT_TIMEZONE;
+
+  // Validate overrides
+  if (!VALID_DAYS.includes(targetDay)) {
+    return res.status(400).json({
+      error: "Invalid targetDay",
+      provided: targetDay,
+      allowed: VALID_DAYS,
+    });
+  }
+  if (!isValidHHMM(eveningStart) || !isValidHHMM(eveningEnd)) {
+    return res.status(400).json({
+      error: "Invalid eveningStart/eveningEnd (expected HH:MM)",
+      provided: { eveningStart, eveningEnd },
+      examples: ["17:00", "18:30", "21:00"],
+    });
+  }
+
   const functionUrl = `${BROWSERLESS_HTTP_BASE.replace(/\/$/, "")}/function?token=${encodeURIComponent(
     BROWSERLESS_TOKEN
   )}`;
 
   // IMPORTANT: Browserless Function is Puppeteer-compatible, not Playwright.
-  // So we avoid Playwright-only selectors like :has-text().
- const code = `
+  // So avoid Playwright-only selectors like :has-text().
+  const code = `
   export default async function ({ page, context }) {
-    const { EMAIL, PASSWORD } = context;
+    const { EMAIL, PASSWORD, TARGET_DAY, EVENING_START, EVENING_END, TIME_ZONE } = context;
 
     page.setDefaultTimeout(30000);
+
+    // Helper (inside Browserless runtime)
+    const hhmmToMinutes = (hhmm) => {
+      const m = /^([01]?\\d|2[0-3]):([0-5]\\d)$/.exec(hhmm || "");
+      if (!m) return null;
+      return Number(m[1]) * 60 + Number(m[2]);
+    };
 
     // 1) Go to Amilia login
     await page.goto("https://app.amilia.com/en/login", {
@@ -90,7 +131,7 @@ app.post("/book", async (req, res) => {
       await page.keyboard.press("Enter");
     }
 
-    // 4) Wait for login to complete
+    // 4) Wait for login to complete (SPA-safe)
     await page.waitForFunction(
       () => !location.href.includes("/login"),
       { timeout: 60000 }
@@ -105,20 +146,29 @@ app.post("/book", async (req, res) => {
       timeout: 60000
     });
 
-    // 6) Return debug info
+    // 6) Return debug info (Phase 1 complete), plus your selected rule values
     const bodyText = await page.evaluate(() => document.body?.innerText || "");
 
     return {
       data: {
         status: "LOGGED_IN_AND_SEARCH_LOADED",
         url: page.url(),
-        pageLength: bodyText.length
+        pageLength: bodyText.length,
+
+        // Rule config that was applied (so you can confirm overrides worked)
+        rule: {
+          targetDay: TARGET_DAY,
+          eveningStart: EVENING_START,
+          eveningEnd: EVENING_END,
+          timeZone: TIME_ZONE,
+          eveningStartMin: hhmmToMinutes(EVENING_START),
+          eveningEndMin: hhmmToMinutes(EVENING_END)
+        }
       },
       type: "application/json"
     };
   }
 `.trim();
-
 
   const controller = new AbortController();
   const timeoutMs = 120000; // allow time for login + navigation
@@ -134,6 +184,12 @@ app.post("/book", async (req, res) => {
         context: {
           EMAIL: AMILIA_EMAIL,
           PASSWORD: AMILIA_PASSWORD,
+
+          // pass rule config
+          TARGET_DAY: targetDay,
+          EVENING_START: eveningStart,
+          EVENING_END: eveningEnd,
+          TIME_ZONE: timeZone,
         },
       }),
     });
