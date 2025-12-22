@@ -55,20 +55,19 @@ app.post("/book", async (req, res) => {
 
   // IMPORTANT: Browserless Function is Puppeteer-compatible, not Playwright.
   // So we avoid Playwright-only selectors like :has-text().
-  const code = `
+ const code = `
   export default async function ({ page, context }) {
     const { EMAIL, PASSWORD } = context;
 
-    // Faster/more stable defaults
     page.setDefaultTimeout(30000);
 
-    // 1) Go directly to Amilia login
+    // 1) Go to Amilia login
     await page.goto("https://app.amilia.com/en/login", {
       waitUntil: "domcontentloaded",
       timeout: 60000
     });
 
-    // 2) Fill email/password (generic selectors)
+    // 2) Fill credentials
     const emailSel = 'input[type="email"], input[name*="email" i]';
     const passSel  = 'input[type="password"], input[name*="password" i]';
 
@@ -78,33 +77,34 @@ app.post("/book", async (req, res) => {
     await page.waitForSelector(passSel);
     await page.type(passSel, PASSWORD, { delay: 10 });
 
-    // 3) Submit by clicking the submit button OR pressing Enter
+    // 3) Submit
     const submitSel = 'button[type="submit"], input[type="submit"]';
     const submit = await page.$(submitSel);
     if (submit) {
       await submit.click();
     } else {
-      // fallback: press Enter in password field
       await page.focus(passSel);
       await page.keyboard.press("Enter");
     }
 
     // 4) Wait for login to complete
-    // We don't assume a full navigation (some apps are SPA).
-    // We'll wait for either:
-    // - URL not containing /login
-    // - OR network idle (some requests finish)
-    await page.waitForFunction(() => !location.href.includes("/login"), { timeout: 60000 })
-      .catch(async () => {
-        await page.waitForNetworkIdle({ idleTime: 1000, timeout: 60000 }).catch(() => {});
-      });
+    await page.waitForFunction(
+      () => !location.href.includes("/login"),
+      { timeout: 60000 }
+    ).catch(() => {});
 
-    // 5) Open badminton search
-    const searchUrl = "https://app.amilia.com/store/en/ville-de-quebec1/api/Activity/Search?textCriteria=badminton";
-    await page.goto(searchUrl, { waitUntil: "networkidle", timeout: 60000 });
+    // 5) Go to badminton search
+    const searchUrl =
+      "https://app.amilia.com/store/en/ville-de-quebec1/api/Activity/Search?textCriteria=badminton";
+
+    await page.goto(searchUrl, {
+      waitUntil: "networkidle2",
+      timeout: 60000
+    });
 
     // 6) Return debug info
     const bodyText = await page.evaluate(() => document.body?.innerText || "");
+
     return {
       data: {
         status: "LOGGED_IN_AND_SEARCH_LOADED",
@@ -114,7 +114,8 @@ app.post("/book", async (req, res) => {
       type: "application/json"
     };
   }
-  `.trim();
+`.trim();
+
 
   const controller = new AbortController();
   const timeoutMs = 120000; // allow time for login + navigation
