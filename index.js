@@ -29,6 +29,9 @@ app.post("/book", async (req, res) => {
     AMILIA_PASSWORD,
   } = process.env;
 
+  // ...
+
+
   if (!BROWSERLESS_HTTP_BASE || !BROWSERLESS_TOKEN) {
     return res.status(500).json({
       error: "Browserless HTTP not configured",
