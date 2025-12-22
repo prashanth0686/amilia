@@ -5,16 +5,11 @@ app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 8080;
 
-// --------------------
 // Health check
-// --------------------
 app.get("/", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// --------------------
-// Auth
-// --------------------
 function requireApiKey(req, res) {
   const apiKey = req.headers["x-api-key"];
   if (!apiKey || apiKey !== process.env.API_KEY) {
@@ -24,13 +19,10 @@ function requireApiKey(req, res) {
   return true;
 }
 
-// --------------------
-// Validation helpers
-// --------------------
 const VALID_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
 function isValidHHMM(v) {
-  // "H:MM" or "HH:MM"
+  // Accepts "H:MM" or "HH:MM"
   return /^([01]?\d|2[0-3]):[0-5]\d$/.test(v || "");
 }
 
@@ -43,15 +35,6 @@ function isValidActivityUrl(u) {
   return u.includes("/shop/activities/");
 }
 
-function hhmmToMinutes(hhmm) {
-  const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(hhmm || "");
-  if (!m) return null;
-  return Number(m[1]) * 60 + Number(m[2]);
-}
-
-// --------------------
-// /book
-// --------------------
 app.post("/book", async (req, res) => {
   if (!requireApiKey(req, res)) return;
 
@@ -82,17 +65,22 @@ app.post("/book", async (req, res) => {
     });
   }
 
-  // ---------- DEFAULTS (Cloud Run env vars) ----------
-  const DEFAULT_TARGET_DAY = process.env.TARGET_DAY || "Wednesday";
+  // === DEFAULTS (from Cloud Run env vars) ===
+  const DEFAULT_TARGET_DAY = process.env.TARGET_DAY || "Saturday";
   const DEFAULT_EVENING_START = process.env.EVENING_START || "18:00";
   const DEFAULT_EVENING_END = process.env.EVENING_END || "21:00";
   const DEFAULT_TIMEZONE = process.env.LOCAL_TZ || "America/Toronto";
   const DEFAULT_ACTIVITY_URL =
     process.env.ACTIVITY_URL ||
-    "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6564610?scrollToCalendar=true&view=month";
+    "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6112282?scrollToCalendar=true&view=month";
+
   const DEFAULT_DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
 
-  // ---------- OVERRIDES (request body) ----------
+  // Polling defaults (race-proof)
+  const DEFAULT_POLL_SECONDS = Number(process.env.POLL_SECONDS || 90);
+  const DEFAULT_POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 3000);
+
+  // === OVERRIDES (from request body) ===
   const body = req.body || {};
 
   const targetDay = body.targetDay ?? DEFAULT_TARGET_DAY;
@@ -100,11 +88,31 @@ app.post("/book", async (req, res) => {
   const eveningEnd = body.eveningEnd ?? DEFAULT_EVENING_END;
   const timeZone = body.timeZone ?? DEFAULT_TIMEZONE;
   const activityUrl = body.activityUrl ?? DEFAULT_ACTIVITY_URL;
+
   const dryRun = typeof body.dryRun === "boolean" ? body.dryRun : DEFAULT_DRY_RUN;
 
-  const rule = { targetDay, eveningStart, eveningEnd, timeZone, activityUrl, dryRun };
+  const pollSeconds =
+    Number.isFinite(body.pollSeconds) && body.pollSeconds > 0
+      ? Number(body.pollSeconds)
+      : DEFAULT_POLL_SECONDS;
 
-  // ---------- VALIDATION ----------
+  const pollIntervalMs =
+    Number.isFinite(body.pollIntervalMs) && body.pollIntervalMs >= 250
+      ? Number(body.pollIntervalMs)
+      : DEFAULT_POLL_INTERVAL_MS;
+
+  const rule = {
+    targetDay,
+    eveningStart,
+    eveningEnd,
+    timeZone,
+    activityUrl,
+    dryRun,
+    pollSeconds,
+    pollIntervalMs,
+  };
+
+  // === VALIDATION ===
   if (!VALID_DAYS.includes(rule.targetDay)) {
     return res.status(400).json({
       error: "Invalid targetDay",
@@ -128,7 +136,7 @@ app.post("/book", async (req, res) => {
       error: "Invalid activityUrl (must include /shop/activities/)",
       provided: rule.activityUrl,
       example:
-        "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6564610?scrollToCalendar=true&view=month&date=2025-12-30",
+        "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6112282?scrollToCalendar=true&view=month",
       rule,
     });
   }
@@ -137,8 +145,11 @@ app.post("/book", async (req, res) => {
     BROWSERLESS_TOKEN
   )}`;
 
-  // Browserless Function API = Puppeteer-like runtime.
-  // IMPORTANT: no page.waitForTimeout() -> use sleep helper
+  /**
+   * IMPORTANT:
+   * Browserless Function API = Puppeteer-like runtime.
+   * No page.waitForTimeout(). Use sleep().
+   */
   const code = `
 export default async function ({ page, context }) {
   const {
@@ -149,7 +160,9 @@ export default async function ({ page, context }) {
     EVENING_END,
     TIME_ZONE,
     ACTIVITY_URL,
-    DRY_RUN
+    DRY_RUN,
+    POLL_SECONDS,
+    POLL_INTERVAL_MS
   } = context;
 
   page.setDefaultTimeout(30000);
@@ -162,33 +175,9 @@ export default async function ({ page, context }) {
     return Number(m[1]) * 60 + Number(m[2]);
   };
 
-  // Parse strings like:
-  // "7:00 pm - 7:55 pm"
-  const parseTimeRangeToMinutes = (s) => {
-    const t = String(s || "").toLowerCase().replace(/\\s+/g, " ").trim();
-    const m = /(\\d{1,2}):(\\d{2})\\s*(am|pm)\\s*[-–]\\s*(\\d{1,2}):(\\d{2})\\s*(am|pm)/i.exec(t);
-    if (!m) return null;
+  const norm = (s) => String(s || "").replace(/\\s+/g, " ").trim();
 
-    const toMin = (hh, mm, ap) => {
-      let h = Number(hh);
-      const minutes = Number(mm);
-      const isPm = ap === "pm";
-      const isAm = ap === "am";
-      if (isPm && h !== 12) h += 12;
-      if (isAm && h === 12) h = 0;
-      return h * 60 + minutes;
-    };
-
-    return {
-      startMin: toMin(m[1], m[2], m[3]),
-      endMin: toMin(m[4], m[5], m[6]),
-      raw: t
-    };
-  };
-
-  // --------------------
-  // 1) Login
-  // --------------------
+  // --- 1) Login ---
   await page.goto("https://app.amilia.com/en/login", {
     waitUntil: "domcontentloaded",
     timeout: 60000
@@ -214,167 +203,158 @@ export default async function ({ page, context }) {
     await page.keyboard.press("Enter");
   }
 
-  // SPA-safe: wait until we're not on /login (best-effort)
   await page.waitForFunction(() => !location.href.includes("/login"), { timeout: 60000 }).catch(() => {});
 
-  // --------------------
-  // 2) Go to activity calendar page
-  // --------------------
-  await page.goto(ACTIVITY_URL, {
-    waitUntil: "networkidle2",
-    timeout: 60000
-  });
+  // --- 2) Go to activity calendar page ---
+  await page.goto(ACTIVITY_URL, { waitUntil: "networkidle2", timeout: 60000 });
+  await sleep(1200); // allow calendar paint
 
-  // Let client JS paint the calendar
-  await sleep(1500);
+  // --- Helpers to find/click the real calendar Register button ---
+  // Your DOM probe showed the real button is: <button type="button" class="register" aria-describedby="event-title-...">
+  const findRealRegisterButtons = () => {
+    // Prefer the specific calendar button signature:
+    const btns = Array.from(document.querySelectorAll('button.register[aria-describedby^="event-title-"]'));
+    return btns;
+  };
 
-  // --------------------
-  // 3) Extract REAL slot tiles + register buttons (ignore nav "Register")
-  //    We only look inside fullcalendar event tiles:
-  //    div.fc-event.activity-segment ...
-  // --------------------
-  const probe = await page.evaluate(() => {
-    const norm = (s) => String(s || "").replace(/\\s+/g, " ").trim();
+  const isVisible = (el) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    if (!r || r.width === 0 || r.height === 0) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    return true;
+  };
 
-    const tiles = Array.from(document.querySelectorAll("div.fc-event.activity-segment"));
-    const results = tiles.map(tile => {
-      const timeText = norm(tile.querySelector(".fc-time")?.innerText);
-      const titleText = norm(tile.querySelector(".fc-title")?.innerText);
-      const registerBtn = tile.querySelector("button.register");
+  const detectState = () => {
+    const url = location.href;
+    const bodyText = norm(document.body?.innerText || "");
 
-      return {
-        hasRegisterButton: !!registerBtn,
-        timeText,
-        titleText,
-        buttonTag: registerBtn ? registerBtn.tagName : null,
-        buttonClass: registerBtn ? registerBtn.className : null,
-        buttonTitle: registerBtn ? registerBtn.getAttribute("title") : null,
-        // small HTML snippet so we can debug if needed
-        tileClass: tile.className
-      };
-    });
+    const success =
+      url.includes("quickRegisterId=") ||
+      /checkout|cart/i.test(url) ||
+      /checkout|cart/i.test(bodyText);
 
-    const registerTileCount = results.filter(r => r.hasRegisterButton).length;
+    const cannotRegister = /cannot register/i.test(bodyText);
+    const notOpenedYet = /registration has not yet been opened/i.test(bodyText);
 
-    return {
-      calendarTilesCount: tiles.length,
-      tilesWithRegisterCount: registerTileCount,
-      sampleTiles: results.slice(0, 5)
-    };
-  });
+    return { url, success, cannotRegister, notOpenedYet };
+  };
 
-  const startWindowMin = hhmmToMinutes(EVENING_START);
-  const endWindowMin   = hhmmToMinutes(EVENING_END);
+  const closeCannotRegisterModalIfPresent = () => {
+    // Try a few common close selectors
+    const closeBtn =
+      document.querySelector('button.close, button[aria-label*="close" i], .modal-dialog button.close, .modal button.close') ||
+      Array.from(document.querySelectorAll("button"))
+        .find(b => /close|ok|continue shopping/i.test((b.innerText || "").trim()));
 
-  // --------------------
-  // 4) Find candidate slot(s) by time window (client-side)
-  // --------------------
-  const candidates = await page.evaluate(({ startWindowMin, endWindowMin }) => {
-    const norm = (s) => String(s || "").replace(/\\s+/g, " ").trim();
-
-    const parseRange = (s) => {
-      const t = String(s || "").toLowerCase().replace(/\\s+/g, " ").trim();
-      const m = /(\\d{1,2}):(\\d{2})\\s*(am|pm)\\s*[-–]\\s*(\\d{1,2}):(\\d{2})\\s*(am|pm)/i.exec(t);
-      if (!m) return null;
-
-      const toMin = (hh, mm, ap) => {
-        let h = Number(hh);
-        const minutes = Number(mm);
-        if (ap === "pm" && h !== 12) h += 12;
-        if (ap === "am" && h === 12) h = 0;
-        return h * 60 + minutes;
-      };
-
-      return {
-        startMin: toMin(m[1], m[2], m[3]),
-        endMin: toMin(m[4], m[5], m[6]),
-        raw: t
-      };
-    };
-
-    const tiles = Array.from(document.querySelectorAll("div.fc-event.activity-segment"));
-    const matched = [];
-
-    for (let i = 0; i < tiles.length; i++) {
-      const tile = tiles[i];
-      const btn = tile.querySelector("button.register");
-      if (!btn) continue;
-
-      const timeText = norm(tile.querySelector(".fc-time")?.innerText);
-      const titleText = norm(tile.querySelector(".fc-title")?.innerText);
-
-      const range = parseRange(timeText);
-      if (!range) continue;
-
-      // Keep only those whose start time is within [startWindowMin, endWindowMin]
-      // and end time <= endWindowMin (strict)
-      const within =
-        range.startMin >= startWindowMin &&
-        range.endMin <= endWindowMin;
-
-      if (within) {
-        matched.push({
-          index: i,
-          timeText,
-          titleText,
-          startMin: range.startMin,
-          endMin: range.endMin,
-          tileClass: tile.className
-        });
-      }
+    if (closeBtn && isVisible(closeBtn)) {
+      closeBtn.click();
+      return true;
     }
+    return false;
+  };
 
-    return matched;
-  }, { startWindowMin, endWindowMin });
+  // --- 3) Poll loop ---
+  const startedAt = Date.now();
+  const maxWaitMs = Math.max(1, Number(POLL_SECONDS || 90)) * 1000;
+  const intervalMs = Math.max(250, Number(POLL_INTERVAL_MS || 3000));
 
-  // --------------------
-  // 5) Click (if not dryRun)
-  // --------------------
+  let attempts = 0;
+  let lastState = null;
   let clickResult = null;
 
-  if (!DRY_RUN && candidates.length > 0) {
-    const targetIndex = candidates[0].index;
+  while ((Date.now() - startedAt) < maxWaitMs) {
+    attempts++;
 
-    const clicked = await page.evaluate(({ targetIndex }) => {
-      const tiles = Array.from(document.querySelectorAll("div.fc-event.activity-segment"));
-      const tile = tiles[targetIndex];
-      if (!tile) return { attempted: true, clicked: false, reason: "tile_not_found" };
+    // State check before trying
+    lastState = await page.evaluate(detectState);
+    if (lastState.success) {
+      clickResult = { outcome: "SUCCESS_ALREADY", attempts, lastState };
+      break;
+    }
 
-      const btn = tile.querySelector("button.register");
-      if (!btn) return { attempted: true, clicked: false, reason: "button_not_found" };
-
-      btn.click();
-      return { attempted: true, clicked: true };
-    }, { targetIndex });
-
-    await sleep(1500);
-
-    // detect modal outcome / url change
-    const postClick = await page.evaluate(() => {
-      const bodyText = String(document.body?.innerText || "").toLowerCase();
-      const cannotRegister = bodyText.includes("cannot register");
-      const notOpenedYet =
-        bodyText.includes("registration has not yet been opened") ||
-        bodyText.includes("has not yet been opened");
-
-      const url = location.href;
-      const hasQuickId = url.includes("quickRegisterId=");
-
-      return { url, cannotRegister, notOpenedYet, hasQuickId };
+    // Find button(s)
+    const found = await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button.register[aria-describedby^="event-title-"]'));
+      const visible = btns.filter(b => {
+        const r = b.getBoundingClientRect();
+        if (!r || r.width === 0 || r.height === 0) return false;
+        const style = window.getComputedStyle(b);
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+        return true;
+      });
+      return { total: btns.length, visible: visible.length };
     });
 
-    clickResult = { ...clicked, postClick };
+    if (found.visible > 0) {
+      if (DRY_RUN) {
+        clickResult = { outcome: "DRY_RUN_FOUND_REGISTER", attempts, found, lastState };
+        break;
+      }
+
+      // Click the first visible real calendar register button
+      const clicked = await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button.register[aria-describedby^="event-title-"]'));
+        const isVis = (b) => {
+          const r = b.getBoundingClientRect();
+          if (!r || r.width === 0 || r.height === 0) return false;
+          const style = window.getComputedStyle(b);
+          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+          return true;
+        };
+        const first = btns.find(isVis);
+        if (!first) return { clicked: false };
+        first.click();
+        return { clicked: true };
+      });
+
+      await sleep(1200);
+
+      const afterClick = await page.evaluate(detectState);
+
+      if (afterClick.success) {
+        clickResult = { outcome: "SUCCESS_CLICKED", attempts, clicked, afterClick };
+        break;
+      }
+
+      // If modal says cannot register, close it and retry
+      if (afterClick.cannotRegister || afterClick.notOpenedYet) {
+        const closed = await page.evaluate(closeCannotRegisterModalIfPresent);
+        await sleep(400);
+        clickResult = { outcome: "NOT_OPENED_YET_RETRYING", attempts, closed, afterClick };
+        // continue polling
+      } else {
+        // Unknown result, keep polling (might be UI delay)
+        clickResult = { outcome: "CLICKED_NO_SUCCESS_YET", attempts, clicked, afterClick };
+      }
+    } else {
+      // No button visible — likely not opened yet, keep polling
+      clickResult = { outcome: "NO_REGISTER_VISIBLE_YET", attempts, found, lastState };
+    }
+
+    await sleep(intervalMs);
+
+    // Optional: refresh once in a while (helps if the calendar data updates without repaint)
+    if (attempts % 8 === 0) {
+      try {
+        await page.reload({ waitUntil: "networkidle2", timeout: 60000 });
+        await sleep(800);
+      } catch (e) {
+        // ignore reload errors, keep going
+      }
+    }
   }
 
-  // --------------------
-  // 6) Return summary
-  // --------------------
+  // Final state
+  const finalState = await page.evaluate(detectState);
+
   return {
     data: {
-      status: DRY_RUN ? "DRY_RUN_OK" : "CLICK_ATTEMPTED",
-      url: page.url(),
-      probe,
-      candidates,
+      status: "POLLING_DONE",
+      url: finalState.url,
+      attempts,
+      finalState,
       clickResult,
       rule: {
         targetDay: TARGET_DAY,
@@ -383,8 +363,10 @@ export default async function ({ page, context }) {
         timeZone: TIME_ZONE,
         activityUrl: ACTIVITY_URL,
         dryRun: DRY_RUN,
-        eveningStartMin: startWindowMin,
-        eveningEndMin: endWindowMin
+        pollSeconds: POLL_SECONDS,
+        pollIntervalMs: POLL_INTERVAL_MS,
+        eveningStartMin: hhmmToMinutes(EVENING_START),
+        eveningEndMin: hhmmToMinutes(EVENING_END)
       }
     },
     type: "application/json"
@@ -413,6 +395,8 @@ export default async function ({ page, context }) {
           TIME_ZONE: rule.timeZone,
           ACTIVITY_URL: rule.activityUrl,
           DRY_RUN: rule.dryRun,
+          POLL_SECONDS: rule.pollSeconds,
+          POLL_INTERVAL_MS: rule.pollIntervalMs,
         },
       }),
     });
