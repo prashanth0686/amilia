@@ -22,7 +22,7 @@ function requireApiKey(req, res) {
 const VALID_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
 function isValidHHMM(v) {
-  // "H:MM" or "HH:MM"
+  // Accepts "H:MM" or "HH:MM"
   return /^([01]?\d|2[0-3]):[0-5]\d$/.test(v || "");
 }
 
@@ -30,32 +30,10 @@ function normalizeBaseUrl(u) {
   return String(u || "").replace(/\/$/, "");
 }
 
-function parseBool(v, defaultValue = false) {
-  if (v === undefined || v === null) return defaultValue;
-  if (typeof v === "boolean") return v;
-  if (typeof v === "number") return v !== 0;
-  if (typeof v === "string") {
-    const s = v.trim().toLowerCase();
-    if (["true", "1", "yes", "y"].includes(s)) return true;
-    if (["false", "0", "no", "n"].includes(s)) return false;
-  }
-  return defaultValue;
-}
-
-function computeBookingOpensInfo(targetDay, timeZone, openHourLocal = 8, leadHours = 48) {
-  // Conceptually: booking opens 48h before at 8:00 AM local time.
-  // We return the "rule" explanation + an example mapping (day -> open day).
-  // This is NOT scheduling; just info to confirm the logic.
-  const idx = VALID_DAYS.indexOf(targetDay);
-  const openDayIdx = (idx - 2 + 7) % 7; // 48h ~= 2 days
-  return {
-    ruleText: "Booking opens 48 hours before at 8:00 AM (local time).",
-    targetDay,
-    opensOnDay: VALID_DAYS[openDayIdx],
-    opensAtLocal: `${String(openHourLocal).padStart(2, "0")}:00`,
-    timeZone,
-    leadHours,
-  };
+// Safer “contains” check for activity URL
+function isValidActivityUrl(u) {
+  if (typeof u !== "string") return false;
+  return u.includes("/shop/activities/");
 }
 
 app.post("/book", async (req, res) => {
@@ -88,34 +66,36 @@ app.post("/book", async (req, res) => {
     });
   }
 
-  // ========= DEFAULTS (Cloud Run env vars) =========
-  const DEFAULT_TARGET_DAY = process.env.TARGET_DAY || "Wednesday";
+  // === DEFAULTS (from Cloud Run env vars) ===
+  const DEFAULT_TARGET_DAY = process.env.TARGET_DAY || "Saturday";
   const DEFAULT_EVENING_START = process.env.EVENING_START || "18:00";
   const DEFAULT_EVENING_END = process.env.EVENING_END || "21:00";
   const DEFAULT_TIMEZONE = process.env.LOCAL_TZ || "America/Toronto";
   const DEFAULT_ACTIVITY_URL =
     process.env.ACTIVITY_URL ||
-    "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6564610?scrollToCalendar=true&view=month";
+    "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6112282?scrollToCalendar=true&view=month";
+  const DEFAULT_DRY_RUN =
+    (process.env.DRY_RUN || "true").toLowerCase() === "true";
 
-  // ========= OVERRIDES (request body) =========
+  // === OVERRIDES (from request body) ===
   const body = req.body || {};
 
-  const rule = {
-    targetDay: body.targetDay ?? DEFAULT_TARGET_DAY,
-    eveningStart: body.eveningStart ?? DEFAULT_EVENING_START,
-    eveningEnd: body.eveningEnd ?? DEFAULT_EVENING_END,
-    timeZone: body.timeZone ?? DEFAULT_TIMEZONE,
-    activityUrl: body.activityUrl ?? DEFAULT_ACTIVITY_URL,
-    // safety switch: default to true (no click) unless explicitly false
-    dryRun: parseBool(body.dryRun, true),
-  };
+  const targetDay = body.targetDay ?? DEFAULT_TARGET_DAY;
+  const eveningStart = body.eveningStart ?? DEFAULT_EVENING_START;
+  const eveningEnd = body.eveningEnd ?? DEFAULT_EVENING_END;
+  const timeZone = body.timeZone ?? DEFAULT_TIMEZONE;
+  const activityUrl = body.activityUrl ?? DEFAULT_ACTIVITY_URL;
+  const dryRun = typeof body.dryRun === "boolean" ? body.dryRun : DEFAULT_DRY_RUN;
 
-  // ========= VALIDATION =========
+  const rule = { targetDay, eveningStart, eveningEnd, timeZone, activityUrl, dryRun };
+
+  // === VALIDATION ===
   if (!VALID_DAYS.includes(rule.targetDay)) {
     return res.status(400).json({
       error: "Invalid targetDay",
       provided: rule.targetDay,
       allowed: VALID_DAYS,
+      rule,
     });
   }
 
@@ -124,15 +104,17 @@ app.post("/book", async (req, res) => {
       error: "Invalid eveningStart/eveningEnd (expected HH:MM)",
       provided: { eveningStart: rule.eveningStart, eveningEnd: rule.eveningEnd },
       examples: ["17:00", "18:30", "21:00"],
+      rule,
     });
   }
 
-  if (typeof rule.activityUrl !== "string" || !rule.activityUrl.includes("/shop/activities/")) {
+  if (!isValidActivityUrl(rule.activityUrl)) {
     return res.status(400).json({
       error: "Invalid activityUrl (must include /shop/activities/)",
       provided: rule.activityUrl,
       example:
-        "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6564610?scrollToCalendar=true&view=month",
+        "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6112282?scrollToCalendar=true&view=month",
+      rule,
     });
   }
 
@@ -140,12 +122,12 @@ app.post("/book", async (req, res) => {
     BROWSERLESS_TOKEN
   )}`;
 
-  // ========= Browserless Function (Puppeteer-like runtime) =========
-  // We:
-  //  - login
-  //  - go to ACTIVITY_URL
-  //  - DOM probe: count "Register" buttons + sample HTML
-  //  - if dryRun=false, click the first "Register" button and return what happens (URL/modal text)
+  /**
+   * IMPORTANT:
+   * Browserless Function API = Puppeteer-like runtime.
+   * Also, page.waitForTimeout() is NOT available in this runtime.
+   * Use: await new Promise(r => setTimeout(r, ms));
+   */
   const code = `
 export default async function ({ page, context }) {
   const {
@@ -161,37 +143,34 @@ export default async function ({ page, context }) {
 
   page.setDefaultTimeout(30000);
 
-  const truncate = (s, n = 1200) => {
-    s = String(s || "");
-    return s.length > n ? s.slice(0, n) + " ...[truncated]" : s;
-  };
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   const hhmmToMinutes = (hhmm) => {
-    const m = /^([01]?\\\\d|2[0-3]):([0-5]\\\\d)$/.exec(hhmm || "");
+    const m = /^([01]?\\d|2[0-3]):([0-5]\\d)$/.exec(hhmm || "");
     if (!m) return null;
     return Number(m[1]) * 60 + Number(m[2]);
   };
 
-  // 1) Login page
+  const normalizeText = (s) => String(s || "").replace(/\\s+/g, " ").trim();
+
+  // ---- 1) Login ----
   await page.goto("https://app.amilia.com/en/login", {
     waitUntil: "domcontentloaded",
     timeout: 60000
   });
 
-  // 2) Fill credentials (resilient selectors)
   const emailSel = 'input[type="email"], input[name*="email" i]';
   const passSel  = 'input[type="password"], input[name*="password" i]';
-  const submitSel = 'button[type="submit"], input[type="submit"]';
 
-  await page.waitForSelector(emailSel, { timeout: 25000 });
+  await page.waitForSelector(emailSel, { timeout: 20000 });
   await page.click(emailSel);
-  await page.keyboard.type(String(EMAIL), { delay: 10 });
+  await page.keyboard.type(EMAIL, { delay: 10 });
 
-  await page.waitForSelector(passSel, { timeout: 25000 });
+  await page.waitForSelector(passSel, { timeout: 20000 });
   await page.click(passSel);
-  await page.keyboard.type(String(PASSWORD), { delay: 10 });
+  await page.keyboard.type(PASSWORD, { delay: 10 });
 
-  // 3) Submit
+  const submitSel = 'button[type="submit"], input[type="submit"]';
   const submit = await page.$(submitSel);
   if (submit) {
     await submit.click();
@@ -200,116 +179,108 @@ export default async function ({ page, context }) {
     await page.keyboard.press("Enter");
   }
 
-  // 4) Wait for login to complete (SPA-safe)
-  await page.waitForFunction(
-    () => !location.href.includes("/login"),
-    { timeout: 60000 }
-  ).catch(() => {});
+  // SPA-safe “login finished”
+  await page.waitForFunction(() => !location.href.includes("/login"), { timeout: 60000 }).catch(() => {});
 
-  // 5) Go directly to the activity calendar page
-  await page.goto(String(ACTIVITY_URL), {
+  // ---- 2) Go to activity calendar page ----
+  await page.goto(ACTIVITY_URL, {
     waitUntil: "networkidle2",
     timeout: 60000
   });
 
-  // Give it a moment for any calendar widgets to render
-  await page.waitForTimeout(1500);
+  // let the calendar JS finish painting
+  await sleep(1500);
 
-  // 6) DOM probe: count + sample the "Register" buttons & surrounding containers
+  // ---- 3) DOM probe: find Register buttons + sample HTML ----
   const domProbe = await page.evaluate(() => {
-    const truncate = (s, n = 1200) => {
-      s = String(s || "");
-      return s.length > n ? s.slice(0, n) + " ...[truncated]" : s;
+    const truncate = (s, n=900) => {
+      const t = String(s || "");
+      return t.length > n ? (t.slice(0, n) + "…[truncated]") : t;
     };
 
-    const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-    const registerButtons = candidates.filter((el) => {
-      const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-      return t === "register" || t.includes("register");
+    // Collect candidate buttons/links that contain "Register"
+    const candidates = Array.from(document.querySelectorAll("button, a, input[type='button'], input[type='submit']"))
+      .map(el => {
+        const text = (el.innerText || el.value || "").trim();
+        return { el, text };
+      })
+      .filter(x => /\\bregister\\b/i.test(x.text));
+
+    const samples = candidates.slice(0, 2).map(x => truncate(x.el.outerHTML, 1000));
+
+    // Try to identify surrounding “tile” containers for the first couple buttons
+    const containerSamples = candidates.slice(0, 2).map(x => {
+      const container = x.el.closest("div, td, li, article, section") || x.el.parentElement;
+      return truncate(container ? container.outerHTML : x.el.outerHTML, 1200);
     });
-
-    const samples = registerButtons.slice(0, 2).map((el) => ({
-      tag: el.tagName,
-      text: (el.innerText || el.textContent || "").trim(),
-      id: el.id || null,
-      className: el.className || null,
-      outerHTML: truncate(el.outerHTML, 1600),
-    }));
-
-    const containerSamples = registerButtons.slice(0, 2).map((btn) => {
-      let node = btn;
-      for (let i = 0; i < 4; i++) {
-        if (node && node.parentElement) node = node.parentElement;
-      }
-      return { aroundButtonOuterHTML: truncate(node?.outerHTML || "", 2200) };
-    });
-
-    // also check if a "Cannot register" dialog exists (your screenshot)
-    const dialogText = Array.from(document.querySelectorAll("div, section, article"))
-      .map(el => (el.innerText || "").trim())
-      .find(t => t.toLowerCase().includes("cannot register")) || null;
 
     return {
-      pageTitle: document.title,
-      registerButtonsCount: registerButtons.length,
+      registerButtonsCount: candidates.length,
       registerButtonsSamples: samples,
-      containerSamples,
-      cannotRegisterTextFound: dialogText ? truncate(dialogText, 600) : null
+      containerSamples
     };
   });
 
+  // ---- 4) Try clicking a visible Register (optional) ----
   let clickResult = null;
-
   if (!DRY_RUN) {
-    // Click the first visible "Register" button by scanning candidates
-    const didClick = await page.evaluate(() => {
-      const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-      const registerButtons = candidates.filter((el) => {
-        const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-        return t === "register" || t.includes("register");
-      });
+    // Try to click the first visible Register button/link on the page.
+    const clicked = await page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll("button, a, input[type='button'], input[type='submit']"));
 
-      const visible = registerButtons.find((el) => {
+      const isVisible = (el) => {
         const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      });
-
-      if (!visible) return false;
-      visible.click();
-      return true;
-    });
-
-    // Wait a moment for modal/redirect
-    await page.waitForTimeout(1500);
-
-    const postClick = await page.evaluate(() => {
-      const truncate = (s, n = 800) => {
-        s = String(s || "");
-        return s.length > n ? s.slice(0, n) + " ...[truncated]" : s;
+        if (!r || r.width === 0 || r.height === 0) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+        return true;
       };
 
-      // Find "Cannot register" dialog
-      const maybeDialog = Array.from(document.querySelectorAll("div, section, article"))
-        .map(el => (el.innerText || "").trim())
-        .find(t => t.toLowerCase().includes("cannot register"));
+      const matchText = (el) => {
+        const t = (el.innerText || el.value || "").trim();
+        return /\\bregister\\b/i.test(t);
+      };
 
-      // Capture current URL (it may add quickRegisterId=...)
+      const target = els.find(el => matchText(el) && isVisible(el));
+      if (!target) return { attempted: true, clickedSomething: false };
+
+      target.click();
+      return { attempted: true, clickedSomething: true };
+    });
+
+    // Let any modal/navigation happen
+    await sleep(1500);
+
+    // Detect the common “Cannot register” modal
+    const postClick = await page.evaluate(() => {
+      const normalize = (s) => String(s || "").replace(/\\s+/g, " ").trim();
+      const bodyText = normalize(document.body?.innerText || "");
+
+      const cannotRegister = /cannot register/i.test(bodyText);
+      const notOpened = /registration has not yet been opened/i.test(bodyText);
+
+      // Try to extract a concise snippet around the modal headline if present
+      let snippet = null;
+      const h2 = Array.from(document.querySelectorAll("h1,h2,h3,div,span"))
+        .map(el => (el.innerText || "").trim())
+        .find(t => /cannot register/i.test(t));
+      if (h2) snippet = h2;
+
       return {
         url: location.href,
-        cannotRegisterText: maybeDialog ? truncate(maybeDialog, 1000) : null
+        cannotRegister,
+        notOpenedYet: notOpened,
+        snippet
       };
     });
 
-    clickResult = {
-      attempted: true,
-      clickedSomething: didClick,
-      postClick
-    };
+    clickResult = { ...clicked, postClick };
   }
 
+  // ---- Return ----
   return {
     data: {
-      status: DRY_RUN ? "DOM_PROBE_OK" : "CLICK_TEST_DONE",
+      status: "DOM_PROBE_OK",
       url: page.url(),
       domProbe,
       clickResult,
@@ -372,14 +343,10 @@ export default async function ({ page, context }) {
       });
     }
 
-    // include booking-open logic explanation in output (so you can confirm Saturday->Thursday, etc.)
-    const bookingOpens = computeBookingOpensInfo(rule.targetDay, rule.timeZone, 8, 48);
-
     return res.json({
       status: "BROWSERLESS_HTTP_OK",
       browserless: parsed,
       rule,
-      bookingOpens,
     });
   } catch (err) {
     const isAbort = err?.name === "AbortError";
