@@ -151,8 +151,6 @@ export default async function ({ page, context }) {
     return Number(m[1]) * 60 + Number(m[2]);
   };
 
-  const normalizeText = (s) => String(s || "").replace(/\\s+/g, " ").trim();
-
   // ---- 1) Login ----
   await page.goto("https://app.amilia.com/en/login", {
     waitUntil: "domcontentloaded",
@@ -191,42 +189,95 @@ export default async function ({ page, context }) {
   // let the calendar JS finish painting
   await sleep(1500);
 
-  // ---- 3) DOM probe: find Register buttons + sample HTML ----
+  // ---- 3) DOM probe: ignore NAV “Register”, only count calendar-slot registers ----
   const domProbe = await page.evaluate(() => {
-    const truncate = (s, n=900) => {
+    const truncate = (s, n = 1200) => {
       const t = String(s || "");
-      return t.length > n ? (t.slice(0, n) + "…[truncated]") : t;
+      return t.length > n ? t.slice(0, n) + " ...[truncated]" : t;
     };
 
-    // Collect candidate buttons/links that contain "Register"
-    const candidates = Array.from(document.querySelectorAll("button, a, input[type='button'], input[type='submit']"))
-      .map(el => {
-        const text = (el.innerText || el.value || "").trim();
-        return { el, text };
-      })
-      .filter(x => /\\bregister\\b/i.test(x.text));
+    const isRegisterText = (el) => {
+      const t = (el.innerText || el.textContent || el.value || "").trim();
+      return /\\bregister\\b/i.test(t);
+    };
 
-    const samples = candidates.slice(0, 2).map(x => truncate(x.el.outerHTML, 1000));
+    const isVisible = (el) => {
+      const r = el.getBoundingClientRect();
+      if (!r || r.width === 0 || r.height === 0) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+      return true;
+    };
 
-    // Try to identify surrounding “tile” containers for the first couple buttons
-    const containerSamples = candidates.slice(0, 2).map(x => {
-      const container = x.el.closest("div, td, li, article, section") || x.el.parentElement;
-      return truncate(container ? container.outerHTML : x.el.outerHTML, 1200);
-    });
+    // Probe ALL "Register" (for comparison/debugging)
+    const allCandidates = Array.from(
+      document.querySelectorAll("button, a, [role='button'], input[type='button'], input[type='submit']")
+    );
+    const allRegister = allCandidates.filter(el => isRegisterText(el));
+    const allRegisterSamples = allRegister.slice(0, 2).map(el => ({
+      tag: el.tagName,
+      text: (el.innerText || el.value || "").trim(),
+      href: el.getAttribute("href"),
+      className: el.className || null,
+      outerHTML: truncate(el.outerHTML, 1000)
+    }));
+
+    // Calendar-root scoping (this is the important part)
+    // The “slot” register buttons are inside the calendar table.
+    const calendarRoot =
+      document.querySelector("table") ||
+      document.querySelector("[class*=calendar]") ||
+      document.querySelector("[id*=calendar]");
+
+    let calendarRegister = [];
+    let calendarRegisterSamples = [];
+
+    if (calendarRoot) {
+      const calendarCandidates = Array.from(
+        calendarRoot.querySelectorAll("button, a, [role='button'], input[type='button'], input[type='submit']")
+      );
+
+      calendarRegister = calendarCandidates
+        .filter(el => isRegisterText(el) && isVisible(el))
+        // Extra safety: ignore top nav tabs/menus even if they appear under calendarRoot
+        .filter(el => !el.closest("nav, header, [role='navigation'], .navbar, .nav, .nav-tabs"));
+
+      calendarRegisterSamples = calendarRegister.slice(0, 2).map(el => {
+        const container =
+          el.closest("td, .fc-daygrid-event, .fc-event, .event, .slot, .tile, div, article, section") ||
+          el.parentElement;
+
+        return {
+          tag: el.tagName,
+          text: (el.innerText || el.value || "").trim(),
+          href: el.getAttribute("href"),
+          className: el.className || null,
+          outerHTML: truncate(el.outerHTML, 1200),
+          containerHTML: truncate(container?.outerHTML || "", 2000),
+        };
+      });
+    }
 
     return {
-      registerButtonsCount: candidates.length,
-      registerButtonsSamples: samples,
-      containerSamples
+      pageTitle: document.title,
+      allRegisterButtonsCount: allRegister.length,
+      allRegisterSamples,
+      calendarRegisterButtonsCount: calendarRegister.length,
+      calendarRegisterSamples,
+      calendarRootFound: !!calendarRoot
     };
   });
 
-  // ---- 4) Try clicking a visible Register (optional) ----
+  // ---- 4) Try clicking a visible calendar Register (optional) ----
   let clickResult = null;
+
   if (!DRY_RUN) {
-    // Try to click the first visible Register button/link on the page.
+    // Click FIRST calendar register button if present
     const clicked = await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll("button, a, input[type='button'], input[type='submit']"));
+      const isRegisterText = (el) => {
+        const t = (el.innerText || el.textContent || el.value || "").trim();
+        return /\\bregister\\b/i.test(t);
+      };
 
       const isVisible = (el) => {
         const r = el.getBoundingClientRect();
@@ -236,22 +287,28 @@ export default async function ({ page, context }) {
         return true;
       };
 
-      const matchText = (el) => {
-        const t = (el.innerText || el.value || "").trim();
-        return /\\bregister\\b/i.test(t);
-      };
+      const calendarRoot =
+        document.querySelector("table") ||
+        document.querySelector("[class*=calendar]") ||
+        document.querySelector("[id*=calendar]");
 
-      const target = els.find(el => matchText(el) && isVisible(el));
-      if (!target) return { attempted: true, clickedSomething: false };
+      if (!calendarRoot) return { attempted: true, clickedSomething: false, reason: "no_calendar_root" };
+
+      const candidates = Array.from(
+        calendarRoot.querySelectorAll("button, a, [role='button'], input[type='button'], input[type='submit']")
+      )
+        .filter(el => isRegisterText(el) && isVisible(el))
+        .filter(el => !el.closest("nav, header, [role='navigation'], .navbar, .nav, .nav-tabs"));
+
+      const target = candidates[0];
+      if (!target) return { attempted: true, clickedSomething: false, reason: "no_calendar_register" };
 
       target.click();
       return { attempted: true, clickedSomething: true };
     });
 
-    // Let any modal/navigation happen
     await sleep(1500);
 
-    // Detect the common “Cannot register” modal
     const postClick = await page.evaluate(() => {
       const normalize = (s) => String(s || "").replace(/\\s+/g, " ").trim();
       const bodyText = normalize(document.body?.innerText || "");
@@ -259,12 +316,11 @@ export default async function ({ page, context }) {
       const cannotRegister = /cannot register/i.test(bodyText);
       const notOpened = /registration has not yet been opened/i.test(bodyText);
 
-      // Try to extract a concise snippet around the modal headline if present
       let snippet = null;
-      const h2 = Array.from(document.querySelectorAll("h1,h2,h3,div,span"))
+      const headline = Array.from(document.querySelectorAll("h1,h2,h3,div,span"))
         .map(el => (el.innerText || "").trim())
         .find(t => /cannot register/i.test(t));
-      if (h2) snippet = h2;
+      if (headline) snippet = headline;
 
       return {
         url: location.href,
