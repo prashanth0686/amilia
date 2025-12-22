@@ -19,19 +19,15 @@ function requireApiKey(req, res) {
   return true;
 }
 
-const VALID_DAYS = [
-  "Sunday",
-  "Monday",
-  "Tuesday",
-  "Wednesday",
-  "Thursday",
-  "Friday",
-  "Saturday",
-];
+const VALID_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
 function isValidHHMM(v) {
   // Accepts "H:MM" or "HH:MM"
   return /^([01]?\d|2[0-3]):[0-5]\d$/.test(v || "");
+}
+
+function normalizeBaseUrl(u) {
+  return String(u || "").replace(/\/$/, "");
 }
 
 app.post("/book", async (req, res) => {
@@ -74,135 +70,151 @@ app.post("/book", async (req, res) => {
     "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6112282?scrollToCalendar=true&view=month";
 
   // === OVERRIDES (from request body) ===
-  // Allows n8n / PowerShell to set a different day/time window/activity without redeploy
   const body = req.body || {};
-  const targetDay = body.targetDay || DEFAULT_TARGET_DAY;
-  const eveningStart = body.eveningStart || DEFAULT_EVENING_START;
-  const eveningEnd = body.eveningEnd || DEFAULT_EVENING_END;
-  const timeZone = body.timeZone || DEFAULT_TIMEZONE;
-  const activityUrl = body.activityUrl || DEFAULT_ACTIVITY_URL;
 
-  // Build rule object (requested format)
+  const targetDay = body.targetDay ?? DEFAULT_TARGET_DAY;
+  const eveningStart = body.eveningStart ?? DEFAULT_EVENING_START;
+  const eveningEnd = body.eveningEnd ?? DEFAULT_EVENING_END;
+  const timeZone = body.timeZone ?? DEFAULT_TIMEZONE;
+  const activityUrl = body.activityUrl ?? DEFAULT_ACTIVITY_URL;
+
   const rule = { targetDay, eveningStart, eveningEnd, timeZone, activityUrl };
 
-  // Validate overrides
-  if (!VALID_DAYS.includes(targetDay)) {
+  // === VALIDATION ===
+  if (!VALID_DAYS.includes(rule.targetDay)) {
     return res.status(400).json({
       error: "Invalid targetDay",
-      provided: targetDay,
+      provided: rule.targetDay,
       allowed: VALID_DAYS,
     });
   }
 
-  if (!isValidHHMM(eveningStart) || !isValidHHMM(eveningEnd)) {
+  if (!isValidHHMM(rule.eveningStart) || !isValidHHMM(rule.eveningEnd)) {
     return res.status(400).json({
       error: "Invalid eveningStart/eveningEnd (expected HH:MM)",
-      provided: { eveningStart, eveningEnd },
+      provided: { eveningStart: rule.eveningStart, eveningEnd: rule.eveningEnd },
       examples: ["17:00", "18:30", "21:00"],
     });
   }
 
-  if (typeof activityUrl !== "string" || !activityUrl.includes("/shop/activities/")) {
+  if (typeof rule.activityUrl !== "string" || !rule.activityUrl.includes("/shop/activities/")) {
     return res.status(400).json({
       error: "Invalid activityUrl (must include /shop/activities/)",
-      provided: activityUrl,
+      provided: rule.activityUrl,
       example:
         "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6112282?scrollToCalendar=true&view=month",
     });
   }
 
-  const functionUrl = `${BROWSERLESS_HTTP_BASE.replace(
-    /\/$/,
-    ""
-  )}/function?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
+  const functionUrl = `${normalizeBaseUrl(BROWSERLESS_HTTP_BASE)}/function?token=${encodeURIComponent(
+    BROWSERLESS_TOKEN
+  )}`;
 
-  // IMPORTANT: Browserless Function is Puppeteer-compatible, not Playwright.
+  // IMPORTANT: Browserless Function API runs a Puppeteer-like runtime.
+  // Use Puppeteer-style APIs: waitUntil: "networkidle2", page.type(), page.$(), etc.
   const code = `
-  export default async function ({ page, context }) {
-    const {
-      EMAIL,
-      PASSWORD,
-      TARGET_DAY,
-      EVENING_START,
-      EVENING_END,
-      TIME_ZONE,
-      ACTIVITY_URL
-    } = context;
+export default async function ({ page, context }) {
+  const {
+    EMAIL,
+    PASSWORD,
+    TARGET_DAY,
+    EVENING_START,
+    EVENING_END,
+    TIME_ZONE,
+    ACTIVITY_URL
+  } = context;
 
-    page.setDefaultTimeout(30000);
+  page.setDefaultTimeout(30000);
 
-    // Helper (inside Browserless runtime)
-    const hhmmToMinutes = (hhmm) => {
-      const m = /^([01]?\\d|2[0-3]):([0-5]\\d)$/.exec(hhmm || "");
-      if (!m) return null;
-      return Number(m[1]) * 60 + Number(m[2]);
-    };
+  // Helpers (Browserless runtime)
+  const hhmmToMinutes = (hhmm) => {
+    const m = /^([01]?\\d|2[0-3]):([0-5]\\d)$/.exec(hhmm || "");
+    if (!m) return null;
+    return Number(m[1]) * 60 + Number(m[2]);
+  };
 
-    // 1) Go to Amilia login
-    await page.goto("https://app.amilia.com/en/login", {
-      waitUntil: "domcontentloaded",
-      timeout: 60000
-    });
+  // 1) Go to Amilia login
+  await page.goto("https://app.amilia.com/en/login", {
+    waitUntil: "domcontentloaded",
+    timeout: 60000
+  });
 
-    // 2) Fill credentials
-    const emailSel = 'input[type="email"], input[name*="email" i]';
-    const passSel  = 'input[type="password"], input[name*="password" i]';
+  // 2) Fill credentials
+  const emailSel = 'input[type="email"], input[name*="email" i]';
+  const passSel  = 'input[type="password"], input[name*="password" i]';
 
-    await page.waitForSelector(emailSel);
-    await page.type(emailSel, EMAIL, { delay: 10 });
+  await page.waitForSelector(emailSel, { timeout: 20000 });
+  await page.click(emailSel);
+  await page.keyboard.type(EMAIL, { delay: 10 });
 
-    await page.waitForSelector(passSel);
-    await page.type(passSel, PASSWORD, { delay: 10 });
+  await page.waitForSelector(passSel, { timeout: 20000 });
+  await page.click(passSel);
+  await page.keyboard.type(PASSWORD, { delay: 10 });
 
-    // 3) Submit
-    const submitSel = 'button[type="submit"], input[type="submit"]';
-    const submit = await page.$(submitSel);
-    if (submit) {
-      await submit.click();
-    } else {
-      await page.focus(passSel);
-      await page.keyboard.press("Enter");
-    }
+  // 3) Submit (button or Enter)
+  const submitSel = 'button[type="submit"], input[type="submit"]';
+  const submit = await page.$(submitSel);
+  if (submit) {
+    await submit.click();
+  } else {
+    await page.focus(passSel);
+    await page.keyboard.press("Enter");
+  }
 
-    // 4) Wait for login to complete (SPA-safe)
-    await page.waitForFunction(
-      () => !location.href.includes("/login"),
-      { timeout: 60000 }
-    ).catch(() => {});
+  // 4) Wait for login to complete (SPA-safe)
+  await page.waitForFunction(
+    () => !location.href.includes("/login"),
+    { timeout: 60000 }
+  ).catch(() => {});
 
-    // 5) Go to your activity calendar page (where slots show after clicking "Register for drop-in")
-    await page.goto(ACTIVITY_URL, {
-      waitUntil: "networkidle2",
-      timeout: 60000
-    });
+  // 5) Go directly to activity calendar page (your "Register for drop-in" destination)
+  await page.goto(ACTIVITY_URL, {
+    waitUntil: "networkidle2",
+    timeout: 60000
+  });
 
-    // 6) Return debug info (Phase 1 complete), plus rule values
-    const bodyText = await page.evaluate(() => document.body?.innerText || "");
+  // 6) Calendar DOM probe (NO clicks yet)
+  const calendarInfo = await page.evaluate(() => {
+    // Try to grab day numbers visible in the month grid
+    const texts = Array.from(document.querySelectorAll("td, div"))
+      .map(el => (el.innerText || "").trim())
+      .filter(t => /^\\d{1,2}$/.test(t));
+
+    // Also try common calendar table markers
+    const hasTable = !!document.querySelector("table");
+    const tableCount = document.querySelectorAll("table").length;
 
     return {
-      data: {
-        status: "LOGGED_IN_AND_ACTIVITY_PAGE_LOADED",
-        url: page.url(),
-        pageLength: bodyText.length,
-
-        // Rule config that was applied (confirms overrides worked)
-        rule: {
-          targetDay: TARGET_DAY,
-          eveningStart: EVENING_START,
-          eveningEnd: EVENING_END,
-          timeZone: TIME_ZONE,
-          activityUrl: ACTIVITY_URL,
-          eveningStartMin: hhmmToMinutes(EVENING_START),
-          eveningEndMin: hhmmToMinutes(EVENING_END)
-        }
-      },
-      type: "application/json"
+      visibleDayNumbers: Array.from(new Set(texts)).slice(0, 31),
+      totalDayNumberTextsFound: texts.length,
+      hasTable,
+      tableCount
     };
-  }
+  });
+
+  return {
+    data: {
+      status: "CALENDAR_VISIBLE",
+      url: page.url(),
+      calendarInfo,
+      rule: {
+        targetDay: TARGET_DAY,
+        eveningStart: EVENING_START,
+        eveningEnd: EVENING_END,
+        timeZone: TIME_ZONE,
+        activityUrl: ACTIVITY_URL,
+        eveningStartMin: hhmmToMinutes(EVENING_START),
+        eveningEndMin: hhmmToMinutes(EVENING_END)
+      }
+    },
+    type: "application/json"
+  };
+}
 `.trim();
 
+  // Cloud Run -> Browserless HTTP call timeout
   const controller = new AbortController();
-  const timeoutMs = 180000; // allow time for login + navigation
+  const timeoutMs = 180000; // 3 minutes
   const t = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
@@ -215,13 +227,11 @@ app.post("/book", async (req, res) => {
         context: {
           EMAIL: AMILIA_EMAIL,
           PASSWORD: AMILIA_PASSWORD,
-
-          // pass rule config
-          TARGET_DAY: targetDay,
-          EVENING_START: eveningStart,
-          EVENING_END: eveningEnd,
-          TIME_ZONE: timeZone,
-          ACTIVITY_URL: activityUrl,
+          TARGET_DAY: rule.targetDay,
+          EVENING_START: rule.eveningStart,
+          EVENING_END: rule.eveningEnd,
+          TIME_ZONE: rule.timeZone,
+          ACTIVITY_URL: rule.activityUrl,
         },
       }),
     });
@@ -240,21 +250,21 @@ app.post("/book", async (req, res) => {
         error: "Browserless Function API error",
         httpStatus: resp.status,
         body: parsed,
+        rule,
       });
     }
 
     return res.json({
       status: "BROWSERLESS_HTTP_OK",
-      rule,
       browserless: parsed,
+      rule,
     });
   } catch (err) {
     const isAbort = err?.name === "AbortError";
     return res.status(504).json({
-      error: isAbort
-        ? "Browserless HTTP request timed out"
-        : "Browserless HTTP request failed",
+      error: isAbort ? "Browserless HTTP request timed out" : "Browserless HTTP request failed",
       details: String(err?.message || err),
+      rule,
     });
   } finally {
     clearTimeout(t);
