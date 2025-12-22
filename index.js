@@ -6,67 +6,43 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 
-function maskWs(ws) {
-  // Remove/obfuscate token if present, so it’s safe to log
-  try {
-    const u = new URL(ws.replace(/^wss:/, "https:"));
-    if (u.searchParams.has("token")) u.searchParams.set("token", "****");
-    return u.toString().replace(/^https:/, "wss:");
-  } catch {
-    return ws.replace(/token=[^&]+/i, "token=****");
-  }
-}
-
-function buildBrowserlessWs(base, token) {
-  // If base already contains token=, use as-is
-  if (base.includes("token=")) return base;
-
-  // Normalize trailing slash behavior
-  const trimmed = base.trim();
-
-  // If it already has a query string, append with &
-  const joiner = trimmed.includes("?") ? "&" : "?";
-
-  return `${trimmed}${joiner}token=${token}`;
-}
-
 // Health check
 app.get("/", (req, res) => {
   res.json({ status: "ok" });
 });
 
 app.post("/book", async (req, res) => {
+  // Simple API key protection (your Cloud Run service can stay public)
   const apiKey = req.headers["x-api-key"];
   if (!apiKey || apiKey !== process.env.API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  const { BROWSERLESS_WS, BROWSERLESS_TOKEN } = process.env;
+  const token = process.env.BROWSERLESS_TOKEN;
+  const proxyServer = process.env.BROWSERLESS_PROXY || "http://proxy.browserless.io:3128";
 
-  // If you configured BROWSERLESS_WS with ?token=... then token can be optional
-  if (!BROWSERLESS_WS) {
-    return res.status(500).json({ error: "Browserless not configured: missing BROWSERLESS_WS" });
-  }
-  if (!BROWSERLESS_TOKEN && !BROWSERLESS_WS.includes("token=")) {
+  if (!token) {
     return res.status(500).json({ error: "Browserless not configured: missing BROWSERLESS_TOKEN" });
   }
 
   let browser;
   try {
-    const ws = buildBrowserlessWs(BROWSERLESS_WS, BROWSERLESS_TOKEN || "");
+    console.log("BOOK: launching Chromium via Browserless proxy");
+    console.log("BOOK: proxy server =", proxyServer);
 
-    console.log("BOOK: starting");
-    console.log("BOOK: Browserless WS =", maskWs(ws));
-
-    // Fail fast if connect hangs
-    const connectPromise = chromium.connect(ws);
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("Browserless connect timeout after 20 seconds")), 20000)
-    );
-
-    browser = await Promise.race([connectPromise, timeoutPromise]);
-
-    console.log("BOOK: connected to Browserless");
+    // IMPORTANT:
+    // - Browserless proxy auth uses username = token, password can be anything (often blank)
+    // - This avoids WebSockets; works well from Cloud Run
+    browser = await chromium.launch({
+      headless: true,
+      proxy: {
+        server: proxyServer,
+        username: token,
+        password: "x",
+      },
+      // Cloud Run containers are locked down; these flags help reliability
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    });
 
     const context = await browser.newContext();
     const page = await context.newPage();
@@ -89,9 +65,7 @@ app.post("/book", async (req, res) => {
 
     try {
       await browser?.close();
-    } catch (closeErr) {
-      console.error("BOOK: error closing browser:", closeErr?.message || String(closeErr));
-    }
+    } catch {}
 
     return res.status(500).json({ error: message });
   }
