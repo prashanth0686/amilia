@@ -19,7 +19,15 @@ function requireApiKey(req, res) {
   return true;
 }
 
-const VALID_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const VALID_DAYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
 
 function isValidHHMM(v) {
   // Accepts "H:MM" or "HH:MM"
@@ -65,7 +73,7 @@ app.post("/book", async (req, res) => {
     });
   }
 
-  // === DEFAULTS (from Cloud Run env vars) ===
+  // === DEFAULTS (Cloud Run env vars) ===
   const DEFAULT_TARGET_DAY = process.env.TARGET_DAY || "Saturday";
   const DEFAULT_EVENING_START = process.env.EVENING_START || "18:00";
   const DEFAULT_EVENING_END = process.env.EVENING_END || "21:00";
@@ -76,11 +84,11 @@ app.post("/book", async (req, res) => {
 
   const DEFAULT_DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
 
-  // Polling defaults (race-proof)
+  // Polling defaults
   const DEFAULT_POLL_SECONDS = Number(process.env.POLL_SECONDS || 90);
   const DEFAULT_POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 3000);
 
-  // === OVERRIDES (from request body) ===
+  // === OVERRIDES (request body) ===
   const body = req.body || {};
 
   const targetDay = body.targetDay ?? DEFAULT_TARGET_DAY;
@@ -135,8 +143,6 @@ app.post("/book", async (req, res) => {
     return res.status(400).json({
       error: "Invalid activityUrl (must include /shop/activities/)",
       provided: rule.activityUrl,
-      example:
-        "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6112282?scrollToCalendar=true&view=month",
       rule,
     });
   }
@@ -145,11 +151,7 @@ app.post("/book", async (req, res) => {
     BROWSERLESS_TOKEN
   )}`;
 
-  /**
-   * IMPORTANT:
-   * Browserless Function API = Puppeteer-like runtime.
-   * No page.waitForTimeout(). Use sleep().
-   */
+  // Browserless Function code (Puppeteer-like runtime)
   const code = `
 export default async function ({ page, context }) {
   const {
@@ -174,8 +176,6 @@ export default async function ({ page, context }) {
     if (!m) return null;
     return Number(m[1]) * 60 + Number(m[2]);
   };
-
-  const norm = (s) => String(s || "").replace(/\\s+/g, " ").trim();
 
   // --- 1) Login ---
   await page.goto("https://app.amilia.com/en/login", {
@@ -207,26 +207,11 @@ export default async function ({ page, context }) {
 
   // --- 2) Go to activity calendar page ---
   await page.goto(ACTIVITY_URL, { waitUntil: "networkidle2", timeout: 60000 });
-  await sleep(1200); // allow calendar paint
+  await sleep(1200);
 
-  // --- Helpers to find/click the real calendar Register button ---
-  // Your DOM probe showed the real button is: <button type="button" class="register" aria-describedby="event-title-...">
-  const findRealRegisterButtons = () => {
-    // Prefer the specific calendar button signature:
-    const btns = Array.from(document.querySelectorAll('button.register[aria-describedby^="event-title-"]'));
-    return btns;
-  };
-
-  const isVisible = (el) => {
-    if (!el) return false;
-    const r = el.getBoundingClientRect();
-    if (!r || r.width === 0 || r.height === 0) return false;
-    const style = window.getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-    return true;
-  };
-
+  // --- Helpers evaluated in-page (NO outer scope leakage) ---
   const detectState = () => {
+    const norm = (s) => String(s || "").replace(/\\s+/g, " ").trim();
     const url = location.href;
     const bodyText = norm(document.body?.innerText || "");
 
@@ -242,7 +227,15 @@ export default async function ({ page, context }) {
   };
 
   const closeCannotRegisterModalIfPresent = () => {
-    // Try a few common close selectors
+    const isVisible = (el) => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      if (!r || r.width === 0 || r.height === 0) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+      return true;
+    };
+
     const closeBtn =
       document.querySelector('button.close, button[aria-label*="close" i], .modal-dialog button.close, .modal button.close') ||
       Array.from(document.querySelectorAll("button"))
@@ -255,98 +248,95 @@ export default async function ({ page, context }) {
     return false;
   };
 
-  // --- 3) Poll loop ---
+  // Real calendar button selector (NOT nav):
+  // <button type="button" class="register" aria-describedby="event-title-...">
+  const calendarRegisterSelector = 'button.register[aria-describedby^="event-title-"]';
+
   const startedAt = Date.now();
   const maxWaitMs = Math.max(1, Number(POLL_SECONDS || 90)) * 1000;
   const intervalMs = Math.max(250, Number(POLL_INTERVAL_MS || 3000));
 
   let attempts = 0;
-  let lastState = null;
   let clickResult = null;
 
   while ((Date.now() - startedAt) < maxWaitMs) {
     attempts++;
 
-    // State check before trying
-    lastState = await page.evaluate(detectState);
-    if (lastState.success) {
-      clickResult = { outcome: "SUCCESS_ALREADY", attempts, lastState };
+    const pre = await page.evaluate(detectState);
+    if (pre.success) {
+      clickResult = { outcome: "SUCCESS_ALREADY", attempts, state: pre };
       break;
     }
 
-    // Find button(s)
-    const found = await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button.register[aria-describedby^="event-title-"]'));
-      const visible = btns.filter(b => {
-        const r = b.getBoundingClientRect();
+    const found = await page.evaluate((sel) => {
+      const isVisible = (el) => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
         if (!r || r.width === 0 || r.height === 0) return false;
-        const style = window.getComputedStyle(b);
+        const style = window.getComputedStyle(el);
         if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
         return true;
-      });
-      return { total: btns.length, visible: visible.length };
-    });
+      };
+
+      const all = Array.from(document.querySelectorAll(sel));
+      const visible = all.filter(isVisible);
+      return { total: all.length, visible: visible.length };
+    }, calendarRegisterSelector);
 
     if (found.visible > 0) {
       if (DRY_RUN) {
-        clickResult = { outcome: "DRY_RUN_FOUND_REGISTER", attempts, found, lastState };
+        clickResult = { outcome: "DRY_RUN_FOUND_REGISTER", attempts, found };
         break;
       }
 
-      // Click the first visible real calendar register button
-      const clicked = await page.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button.register[aria-describedby^="event-title-"]'));
-        const isVis = (b) => {
-          const r = b.getBoundingClientRect();
+      const clicked = await page.evaluate((sel) => {
+        const isVisible = (el) => {
+          if (!el) return false;
+          const r = el.getBoundingClientRect();
           if (!r || r.width === 0 || r.height === 0) return false;
-          const style = window.getComputedStyle(b);
+          const style = window.getComputedStyle(el);
           if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
           return true;
         };
-        const first = btns.find(isVis);
+
+        const all = Array.from(document.querySelectorAll(sel));
+        const first = all.find(isVisible);
         if (!first) return { clicked: false };
         first.click();
         return { clicked: true };
-      });
+      }, calendarRegisterSelector);
 
       await sleep(1200);
 
-      const afterClick = await page.evaluate(detectState);
+      const post = await page.evaluate(detectState);
 
-      if (afterClick.success) {
-        clickResult = { outcome: "SUCCESS_CLICKED", attempts, clicked, afterClick };
+      if (post.success) {
+        clickResult = { outcome: "SUCCESS_CLICKED", attempts, clicked, state: post };
         break;
       }
 
-      // If modal says cannot register, close it and retry
-      if (afterClick.cannotRegister || afterClick.notOpenedYet) {
+      if (post.cannotRegister || post.notOpenedYet) {
         const closed = await page.evaluate(closeCannotRegisterModalIfPresent);
         await sleep(400);
-        clickResult = { outcome: "NOT_OPENED_YET_RETRYING", attempts, closed, afterClick };
-        // continue polling
+        clickResult = { outcome: "NOT_OPENED_YET_RETRYING", attempts, closed, state: post };
       } else {
-        // Unknown result, keep polling (might be UI delay)
-        clickResult = { outcome: "CLICKED_NO_SUCCESS_YET", attempts, clicked, afterClick };
+        clickResult = { outcome: "CLICKED_NO_SUCCESS_YET", attempts, clicked, state: post };
       }
     } else {
-      // No button visible — likely not opened yet, keep polling
-      clickResult = { outcome: "NO_REGISTER_VISIBLE_YET", attempts, found, lastState };
+      clickResult = { outcome: "NO_REGISTER_VISIBLE_YET", attempts, found };
     }
 
     await sleep(intervalMs);
 
-    // Optional: refresh once in a while (helps if the calendar data updates without repaint)
+    // Refresh sometimes (helps repaint)
     if (attempts % 8 === 0) {
       try {
         await page.reload({ waitUntil: "networkidle2", timeout: 60000 });
         await sleep(800);
-      } catch (e) {
-        // ignore reload errors, keep going
-      }
+      } catch {}
     }
   }
 
-  // Final state
   const finalState = await page.evaluate(detectState);
 
   return {
@@ -374,7 +364,6 @@ export default async function ({ page, context }) {
 }
 `.trim();
 
-  // Cloud Run -> Browserless HTTP call timeout
   const controller = new AbortController();
   const timeoutMs = 180000; // 3 minutes
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -427,7 +416,9 @@ export default async function ({ page, context }) {
   } catch (err) {
     const isAbort = err?.name === "AbortError";
     return res.status(504).json({
-      error: isAbort ? "Browserless HTTP request timed out" : "Browserless HTTP request failed",
+      error: isAbort
+        ? "Browserless HTTP request timed out"
+        : "Browserless HTTP request failed",
       details: String(err?.message || err),
       rule,
     });
