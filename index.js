@@ -500,6 +500,11 @@ export default async function ({ page, context }) {
 
     // Helpful server-side log line for Cloud Run logs
     console.log("[BOOK] Browserless response:", JSON.stringify(parsed?.data || parsed).slice(0, 2000));
+console.log("BOOK_RESULT", JSON.stringify({
+  status: "BROWSERLESS_HTTP_OK",
+  rule,
+  browserless: parsed?.data?.data || parsed?.data || parsed
+}));
 
     return res.json({
       status: "BROWSERLESS_HTTP_OK",
