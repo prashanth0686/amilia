@@ -19,15 +19,7 @@ function requireApiKey(req, res) {
   return true;
 }
 
-const VALID_DAYS = [
-  "Sunday",
-  "Monday",
-  "Tuesday",
-  "Wednesday",
-  "Thursday",
-  "Friday",
-  "Saturday",
-];
+const VALID_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
 function isValidHHMM(v) {
   // Accepts "H:MM" or "HH:MM"
@@ -47,8 +39,7 @@ function isValidCalendarUrl(u) {
 app.post("/book", async (req, res) => {
   if (!requireApiKey(req, res)) return;
 
-  const { BROWSERLESS_HTTP_BASE, BROWSERLESS_TOKEN, AMILIA_EMAIL, AMILIA_PASSWORD } =
-    process.env;
+  const { BROWSERLESS_HTTP_BASE, BROWSERLESS_TOKEN, AMILIA_EMAIL, AMILIA_PASSWORD } = process.env;
 
   if (!BROWSERLESS_HTTP_BASE || !BROWSERLESS_TOKEN) {
     return res.status(500).json({
@@ -91,14 +82,12 @@ app.post("/book", async (req, res) => {
   const timeZone = body.timeZone ?? DEFAULT_TIMEZONE;
   const activityUrl = body.activityUrl ?? DEFAULT_ACTIVITY_URL;
   const dryRun = typeof body.dryRun === "boolean" ? body.dryRun : DEFAULT_DRY_RUN;
-
-  const pollSeconds = Number.isFinite(Number(body.pollSeconds))
-    ? Number(body.pollSeconds)
-    : DEFAULT_POLL_SECONDS;
-
-  const pollIntervalMs = Number.isFinite(Number(body.pollIntervalMs))
-    ? Number(body.pollIntervalMs)
-    : DEFAULT_POLL_INTERVAL_MS;
+  const pollSeconds =
+    Number.isFinite(Number(body.pollSeconds)) ? Number(body.pollSeconds) : DEFAULT_POLL_SECONDS;
+  const pollIntervalMs =
+    Number.isFinite(Number(body.pollIntervalMs))
+      ? Number(body.pollIntervalMs)
+      : DEFAULT_POLL_INTERVAL_MS;
 
   const rule = {
     targetDay,
@@ -132,8 +121,7 @@ app.post("/book", async (req, res) => {
 
   if (!isValidCalendarUrl(rule.activityUrl)) {
     return res.status(400).json({
-      error:
-        "Invalid activityUrl (must include /shop/activities/ OR /shop/programs/calendar/)",
+      error: "Invalid activityUrl (must include /shop/activities/ OR /shop/programs/calendar/)",
       provided: rule.activityUrl,
       examplePrograms:
         "https://app.amilia.com/store/en/ville-de-quebec1/shop/programs/calendar/126867?view=basicWeek&scrollToCalendar=true&date=2025-12-27",
@@ -143,9 +131,9 @@ app.post("/book", async (req, res) => {
     });
   }
 
-  const functionUrl = `${normalizeBaseUrl(
-    BROWSERLESS_HTTP_BASE
-  )}/function?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
+  const functionUrl = `${normalizeBaseUrl(BROWSERLESS_HTTP_BASE)}/function?token=${encodeURIComponent(
+    BROWSERLESS_TOKEN
+  )}`;
 
   /**
    * Browserless Function API = Puppeteer-like runtime.
@@ -215,30 +203,27 @@ export default async function ({ page, context }) {
   const maxAttempts = Math.max(1, Math.floor((Number(POLL_SECONDS) * 1000) / Number(POLL_INTERVAL_MS)));
   let attempts = 0;
 
-  // ✅ STRICT success detection (fixes false positives)
+  // STRICT success detection:
+  // Only treat as success if we entered quick-register or cart/checkout flows (URL-based).
   const getState = async () => {
     return await page.evaluate(() => {
       const normalize = (s) => String(s || "").replace(/\\s+/g, " ").trim();
       const bodyText = normalize(document.body?.innerText || "");
-
       const url = location.href;
 
-      // Success signals:
-      // 1) quickRegisterId in URL (strongest)
-      // 2) actually on cart/checkout URL path
       const hasQuickReg = /[?&]quickRegisterId=\\d+/.test(url);
-      const onCartOrCheckout = /\\/cart\\b/i.test(url) || /\\/checkout\\b/i.test(url);
-
-      const success = Boolean(hasQuickReg || onCartOrCheckout);
+      const onCart = /\\/cart\\b/i.test(url);
+      const onCheckout = /\\/checkout\\b/i.test(url);
 
       const cannotRegister = /cannot register/i.test(bodyText);
       const notOpenedYet = /registration has not yet been opened/i.test(bodyText);
 
       return {
         url,
-        success,
         hasQuickReg,
-        onCartOrCheckout,
+        onCart,
+        onCheckout,
+        success: Boolean(hasQuickReg || onCart || onCheckout),
         cannotRegister,
         notOpenedYet
       };
@@ -250,7 +235,7 @@ export default async function ({ page, context }) {
       const closeCandidates = Array.from(document.querySelectorAll("button, a, [role='button']"));
       const byText = closeCandidates.find(el => {
         const t = (el.innerText || "").trim();
-        return /^close$/i.test(t) || /^x$/i.test(t) || /continue shopping/i.test(t) || /ok$/i.test(t);
+        return /^close$/i.test(t) || /^x$/i.test(t) || /continue shopping/i.test(t);
       });
       if (byText) { byText.click(); return true; }
 
@@ -265,7 +250,6 @@ export default async function ({ page, context }) {
     return await page.evaluate(({ windowStartMin, windowEndMin }) => {
       const normalize = (s) => String(s || "").replace(/\\s+/g, " ").trim();
 
-      // helper to see if element is visible
       const isVisible = (el) => {
         if (!el) return false;
         const r = el.getBoundingClientRect();
@@ -275,19 +259,14 @@ export default async function ({ page, context }) {
         return true;
       };
 
-      // Only consider FullCalendar tiles / activity segments (avoids nav "Register")
+      // Only consider Register buttons inside calendar/event containers (ignore nav/menu)
       const eventContainers = Array.from(document.querySelectorAll(
-        ".fc-event, .fc-day-grid-event, .fc-time-grid-event, .activity-segment, div[role='presentation']"
+        ".fc-event, .fc-day-grid-event, .fc-time-grid-event, .activity-segment, [id^='event-title-']"
       ));
 
       const candidates = [];
       for (const container of eventContainers) {
-        const btn =
-          container.querySelector("button.register") ||
-          container.querySelector("a.register") ||
-          container.querySelector("button[title='Register']") ||
-          container.querySelector("a[title='Register']");
-
+        const btn = container.querySelector("button.register, a.register, button[title='Register'], a[title='Register']");
         if (!btn) continue;
         if (!isVisible(btn)) continue;
 
@@ -298,7 +277,7 @@ export default async function ({ page, context }) {
       const parseStartMinutes = (text) => {
         const s = text.toLowerCase();
 
-        // 12h like "7:00 pm"
+        // 12h: 7:00 pm
         let m = s.match(/\\b(\\d{1,2}):(\\d{2})\\s*(am|pm)\\b/);
         if (m) {
           let hh = Number(m[1]);
@@ -309,7 +288,7 @@ export default async function ({ page, context }) {
           return hh * 60 + mm;
         }
 
-        // 24h like "19:00"
+        // 24h: 19:00
         m = s.match(/\\b([01]?\\d|2[0-3]):([0-5]\\d)\\b/);
         if (m) return Number(m[1]) * 60 + Number(m[2]);
 
@@ -318,9 +297,8 @@ export default async function ({ page, context }) {
 
       const filtered = candidates
         .map(c => ({ ...c, startMin: parseStartMinutes(c.text) }))
-        .filter(c => c.startMin != null && c.startMin >= windowStartMin && c.startMin <= windowEndMin);
-
-      filtered.sort((a, b) => a.startMin - b.startMin);
+        .filter(c => c.startMin != null && c.startMin >= windowStartMin && c.startMin <= windowEndMin)
+        .sort((a, b) => a.startMin - b.startMin);
 
       const pick = filtered[0] || candidates[0] || null;
       if (!pick) {
@@ -339,7 +317,7 @@ export default async function ({ page, context }) {
     }, { windowStartMin, windowEndMin });
   };
 
-  // If already success (rare), return
+  // If already success (rare), return (STRICT now)
   const initial = await getState();
   if (initial.success) {
     return {
@@ -388,9 +366,18 @@ export default async function ({ page, context }) {
     }
 
     lastClick = await pickAndClickCalendarRegister();
-    await sleep(1200);
 
-    lastState = await getState();
+    // small wait for SPA navigation to settle
+    await sleep(800);
+
+    // extra short loop to catch delayed quickRegister/cart transitions
+    for (let i = 0; i < 5; i++) {
+      await sleep(500);
+      const s = await getState();
+      if (s.success) { lastState = s; break; }
+      lastState = s;
+    }
+
     if (lastState.success) break;
 
     if (lastState.cannotRegister || lastState.notOpenedYet) {
@@ -411,9 +398,7 @@ export default async function ({ page, context }) {
       url: finalState.url,
       attempts,
       finalState,
-      clickResult: lastClick
-        ? { outcome, attempts, lastClick, state: finalState }
-        : { outcome, attempts, state: finalState },
+      clickResult: lastClick ? { outcome, attempts, lastClick, state: finalState } : { outcome, attempts, state: finalState },
       rule: {
         targetDay: TARGET_DAY,
         eveningStart: EVENING_START,
@@ -477,6 +462,7 @@ export default async function ({ page, context }) {
       });
     }
 
+    // Helpful server-side log line for Cloud Run logs
     console.log("[BOOK] Browserless response:", JSON.stringify(parsed?.data || parsed).slice(0, 2000));
     console.log(
       "BOOK_RESULT",
@@ -495,9 +481,7 @@ export default async function ({ page, context }) {
   } catch (err) {
     const isAbort = err?.name === "AbortError";
     return res.status(504).json({
-      error: isAbort
-        ? "Browserless HTTP request timed out"
-        : "Browserless HTTP request failed",
+      error: isAbort ? "Browserless HTTP request timed out" : "Browserless HTTP request failed",
       details: String(err?.message || err),
       rule,
     });
@@ -507,5 +491,5 @@ export default async function ({ page, context }) {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(\`Server running on port \${PORT}\`);
 });
