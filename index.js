@@ -43,6 +43,62 @@ function isValidCalendarUrl(u) {
   return u.includes("/shop/activities/") || u.includes("/shop/programs/calendar/");
 }
 
+// --- server-side sleep + retry helpers (fixes Browserless 429 / transient errors) ---
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchWithRetry(
+  url,
+  options,
+  { retries = 6, baseDelayMs = 1500 } = {}
+) {
+  let lastText = "";
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const resp = await fetch(url, options).catch((e) => {
+      console.log("BROWSERLESS_FETCH_ERROR", String(e));
+      return null;
+    });
+
+    if (!resp) {
+      const delay =
+        Math.min(30000, baseDelayMs * 2 ** attempt) +
+        Math.floor(Math.random() * 250);
+      console.log(
+        `BROWSERLESS_RETRY_NO_RESP attempt=${attempt + 1}/${
+          retries + 1
+        } delay=${delay}ms`
+      );
+      await sleep(delay);
+      continue;
+    }
+
+    // Retry on typical transient statuses (incl. 429)
+    if (![408, 425, 429, 500, 502, 503, 504].includes(resp.status)) {
+      return resp;
+    }
+
+    lastText = await resp.text().catch(() => "");
+    console.log(
+      "BROWSERLESS_RETRY_STATUS",
+      resp.status,
+      lastText.slice(0, 300)
+    );
+
+    const delay =
+      Math.min(30000, baseDelayMs * 2 ** attempt) +
+      Math.floor(Math.random() * 250);
+    console.log(
+      `BROWSERLESS_RETRY attempt=${attempt + 1}/${
+        retries + 1
+      } status=${resp.status} delay=${delay}ms`
+    );
+    await sleep(delay);
+  }
+
+  const err = new Error("Browserless failed after retries");
+  err.lastText = lastText;
+  throw err;
+}
+
 app.post("/book", async (req, res) => {
   if (!requireApiKey(req, res)) return;
 
@@ -81,9 +137,12 @@ app.post("/book", async (req, res) => {
   const DEFAULT_ACTIVITY_URL =
     process.env.ACTIVITY_URL ||
     "https://app.amilia.com/store/en/ville-de-quebec1/shop/programs/calendar/126867?view=basicWeek&scrollToCalendar=true";
-  const DEFAULT_DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+  const DEFAULT_DRY_RUN =
+    (process.env.DRY_RUN || "true").toLowerCase() === "true";
   const DEFAULT_POLL_SECONDS = Number(process.env.POLL_SECONDS || "90");
-  const DEFAULT_POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || "3000");
+  const DEFAULT_POLL_INTERVAL_MS = Number(
+    process.env.POLL_INTERVAL_MS || "3000"
+  );
 
   // === OVERRIDES (request body) ===
   const body = req.body || {};
@@ -93,11 +152,14 @@ app.post("/book", async (req, res) => {
   const eveningEnd = body.eveningEnd ?? DEFAULT_EVENING_END;
   const timeZone = body.timeZone ?? DEFAULT_TIMEZONE;
   const activityUrl = body.activityUrl ?? DEFAULT_ACTIVITY_URL;
-  const dryRun = typeof body.dryRun === "boolean" ? body.dryRun : DEFAULT_DRY_RUN;
-  const pollSeconds =
-    Number.isFinite(Number(body.pollSeconds)) ? Number(body.pollSeconds) : DEFAULT_POLL_SECONDS;
-  const pollIntervalMs =
-    Number.isFinite(Number(body.pollIntervalMs)) ? Number(body.pollIntervalMs) : DEFAULT_POLL_INTERVAL_MS;
+  const dryRun =
+    typeof body.dryRun === "boolean" ? body.dryRun : DEFAULT_DRY_RUN;
+  const pollSeconds = Number.isFinite(Number(body.pollSeconds))
+    ? Number(body.pollSeconds)
+    : DEFAULT_POLL_SECONDS;
+  const pollIntervalMs = Number.isFinite(Number(body.pollIntervalMs))
+    ? Number(body.pollIntervalMs)
+    : DEFAULT_POLL_INTERVAL_MS;
 
   const rule = {
     targetDay,
@@ -131,7 +193,8 @@ app.post("/book", async (req, res) => {
 
   if (!isValidCalendarUrl(rule.activityUrl)) {
     return res.status(400).json({
-      error: "Invalid activityUrl (must include /shop/activities/ OR /shop/programs/calendar/)",
+      error:
+        "Invalid activityUrl (must include /shop/activities/ OR /shop/programs/calendar/)",
       provided: rule.activityUrl,
       examplePrograms:
         "https://app.amilia.com/store/en/ville-de-quebec1/shop/programs/calendar/126867?view=basicWeek&scrollToCalendar=true&date=2025-12-27",
@@ -141,9 +204,9 @@ app.post("/book", async (req, res) => {
     });
   }
 
-  const functionUrl = `${normalizeBaseUrl(BROWSERLESS_HTTP_BASE)}/function?token=${encodeURIComponent(
-    BROWSERLESS_TOKEN
-  )}`;
+  const functionUrl = `${normalizeBaseUrl(
+    BROWSERLESS_HTTP_BASE
+  )}/function?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
 
   /**
    * Browserless Function API = Puppeteer-like runtime.
@@ -330,8 +393,6 @@ export default async function ({ page, context }) {
   let lastClick = null;
   let lastState = await getState();
 
-  // NOTE: We no longer instantly return SUCCESS_ALREADY unless strict condition hit
-  // This avoids false positives.
   // If already success, return (rare)
   if (lastState.success) {
     return {
@@ -403,24 +464,28 @@ export default async function ({ page, context }) {
   const t = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const resp = await fetch(functionUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal: controller.signal,
-      body: JSON.stringify({
-        code,
-        context: {
-          EMAIL: AMILIA_EMAIL,
-          PASSWORD: AMILIA_PASSWORD,
-          EVENING_START: rule.eveningStart,
-          EVENING_END: rule.eveningEnd,
-          ACTIVITY_URL: rule.activityUrl,
-          DRY_RUN: rule.dryRun,
-          POLL_SECONDS: rule.pollSeconds,
-          POLL_INTERVAL_MS: rule.pollIntervalMs,
-        },
-      }),
-    });
+    const resp = await fetchWithRetry(
+      functionUrl,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          code,
+          context: {
+            EMAIL: AMILIA_EMAIL,
+            PASSWORD: AMILIA_PASSWORD,
+            EVENING_START: rule.eveningStart,
+            EVENING_END: rule.eveningEnd,
+            ACTIVITY_URL: rule.activityUrl,
+            DRY_RUN: rule.dryRun,
+            POLL_SECONDS: rule.pollSeconds,
+            POLL_INTERVAL_MS: rule.pollIntervalMs,
+          },
+        }),
+      },
+      { retries: 6, baseDelayMs: 1500 }
+    );
 
     const text = await resp.text();
 
@@ -432,6 +497,7 @@ export default async function ({ page, context }) {
     }
 
     if (!resp.ok) {
+      console.log("BROWSERLESS_ERROR_STATUS", resp.status);
       console.log("BROWSERLESS_ERROR_BODY", JSON.stringify(parsed).slice(0, 4000));
       return res.status(502).json({
         error: "Browserless Function API error",
@@ -467,8 +533,14 @@ export default async function ({ page, context }) {
     });
   } catch (err) {
     const isAbort = err?.name === "AbortError";
+    console.log("BROWSERLESS_FATAL_ERROR", String(err?.message || err));
+    if (err?.lastText) {
+      console.log("BROWSERLESS_FATAL_LAST_TEXT", String(err.lastText).slice(0, 2000));
+    }
     return res.status(504).json({
-      error: isAbort ? "Browserless HTTP request timed out" : "Browserless HTTP request failed",
+      error: isAbort
+        ? "Browserless HTTP request timed out"
+        : "Browserless HTTP request failed after retries",
       details: String(err?.message || err),
       rule,
     });
