@@ -5,7 +5,11 @@ app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 8080;
 
-// Health check
+// ---- Simple in-memory lock (prevents parallel Browserless calls) ----
+// Cloud Run can handle concurrent requests; you do NOT want two scheduler jobs hitting browserless at once.
+let RUNNING = false;
+let RUNNING_SINCE = null;
+
 app.get("/", (req, res) => {
   res.json({ status: "ok" });
 });
@@ -19,15 +23,7 @@ function requireApiKey(req, res) {
   return true;
 }
 
-const VALID_DAYS = [
-  "Sunday",
-  "Monday",
-  "Tuesday",
-  "Wednesday",
-  "Thursday",
-  "Friday",
-  "Saturday",
-];
+const VALID_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
 function isValidHHMM(v) {
   return /^([01]?\d|2[0-3]):[0-5]\d$/.test(v || "");
@@ -37,182 +33,191 @@ function normalizeBaseUrl(u) {
   return String(u || "").replace(/\/$/, "");
 }
 
-// Accept Activities OR Programs Calendar
 function isValidCalendarUrl(u) {
   if (typeof u !== "string") return false;
   return u.includes("/shop/activities/") || u.includes("/shop/programs/calendar/");
 }
 
-// --- server-side sleep + retry helpers (fixes Browserless 429 / transient errors) ---
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
-async function fetchWithRetry(
-  url,
-  options,
-  { retries = 6, baseDelayMs = 1500 } = {}
-) {
-  let lastText = "";
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    const resp = await fetch(url, options).catch((e) => {
-      console.log("BROWSERLESS_FETCH_ERROR", String(e));
-      return null;
-    });
+function jitter(ms) {
+  const delta = Math.floor(ms * 0.2);
+  return ms + Math.floor(Math.random() * (delta * 2 + 1)) - delta;
+}
 
-    if (!resp) {
-      const delay =
-        Math.min(30000, baseDelayMs * 2 ** attempt) +
-        Math.floor(Math.random() * 250);
-      console.log(
-        `BROWSERLESS_RETRY_NO_RESP attempt=${attempt + 1}/${
-          retries + 1
-        } delay=${delay}ms`
-      );
-      await sleep(delay);
-      continue;
+// Retry only for transient Browserless errors (429, 5xx, timeouts)
+async function fetchWithRetry(url, options, {
+  maxAttempts = 4,
+  baseDelayMs = 1200,
+  maxDelayMs = 12000
+} = {}) {
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const resp = await fetch(url, options);
+
+      // Retry on 429 and 5xx
+      if (resp.status === 429 || (resp.status >= 500 && resp.status <= 599)) {
+        const bodyText = await resp.text().catch(() => "");
+        const delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
+        const waitMs = jitter(delay);
+
+        console.log("BROWSERLESS_TRANSIENT_HTTP", JSON.stringify({
+          attempt,
+          status: resp.status,
+          waitMs,
+          bodyPreview: bodyText.slice(0, 300)
+        }));
+
+        if (attempt === maxAttempts) {
+          return { resp, text: bodyText };
+        }
+
+        await sleep(waitMs);
+        continue;
+      }
+
+      const text = await resp.text();
+      return { resp, text };
+
+    } catch (err) {
+      lastErr = err;
+      const delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
+      const waitMs = jitter(delay);
+
+      console.log("BROWSERLESS_TRANSIENT_ERR", JSON.stringify({
+        attempt,
+        waitMs,
+        message: String(err?.message || err)
+      }));
+
+      if (attempt === maxAttempts) throw lastErr;
+      await sleep(waitMs);
     }
-
-    // Retry on typical transient statuses (incl. 429)
-    if (![408, 425, 429, 500, 502, 503, 504].includes(resp.status)) {
-      return resp;
-    }
-
-    lastText = await resp.text().catch(() => "");
-    console.log(
-      "BROWSERLESS_RETRY_STATUS",
-      resp.status,
-      lastText.slice(0, 300)
-    );
-
-    const delay =
-      Math.min(30000, baseDelayMs * 2 ** attempt) +
-      Math.floor(Math.random() * 250);
-    console.log(
-      `BROWSERLESS_RETRY attempt=${attempt + 1}/${
-        retries + 1
-      } status=${resp.status} delay=${delay}ms`
-    );
-    await sleep(delay);
   }
 
-  const err = new Error("Browserless failed after retries");
-  err.lastText = lastText;
-  throw err;
+  throw lastErr || new Error("fetchWithRetry failed");
 }
 
 app.post("/book", async (req, res) => {
   if (!requireApiKey(req, res)) return;
 
-  const {
-    BROWSERLESS_HTTP_BASE,
-    BROWSERLESS_TOKEN,
-    AMILIA_EMAIL,
-    AMILIA_PASSWORD,
-  } = process.env;
-
-  if (!BROWSERLESS_HTTP_BASE || !BROWSERLESS_TOKEN) {
-    return res.status(500).json({
-      error: "Browserless HTTP not configured",
-      missing: {
-        BROWSERLESS_HTTP_BASE: !BROWSERLESS_HTTP_BASE,
-        BROWSERLESS_TOKEN: !BROWSERLESS_TOKEN,
-      },
+  // Optional: reject if already running (prevents double scheduler jobs colliding)
+  if (RUNNING) {
+    return res.status(409).json({
+      error: "Another booking run is already in progress",
+      runningSince: RUNNING_SINCE,
     });
   }
 
-  if (!AMILIA_EMAIL || !AMILIA_PASSWORD) {
-    return res.status(500).json({
-      error: "Amilia credentials not configured",
-      missing: {
-        AMILIA_EMAIL: !AMILIA_EMAIL,
-        AMILIA_PASSWORD: !AMILIA_PASSWORD,
-      },
-    });
-  }
+  RUNNING = true;
+  RUNNING_SINCE = new Date().toISOString();
 
-  // === DEFAULTS (Cloud Run env vars) ===
-  const DEFAULT_TARGET_DAY = process.env.TARGET_DAY || "Saturday";
-  const DEFAULT_EVENING_START = process.env.EVENING_START || "13:00";
-  const DEFAULT_EVENING_END = process.env.EVENING_END || "20:00";
-  const DEFAULT_TIMEZONE = process.env.LOCAL_TZ || "America/Toronto";
-  const DEFAULT_ACTIVITY_URL =
-    process.env.ACTIVITY_URL ||
-    "https://app.amilia.com/store/en/ville-de-quebec1/shop/programs/calendar/126867?view=basicWeek&scrollToCalendar=true";
-  const DEFAULT_DRY_RUN =
-    (process.env.DRY_RUN || "true").toLowerCase() === "true";
-  const DEFAULT_POLL_SECONDS = Number(process.env.POLL_SECONDS || "90");
-  const DEFAULT_POLL_INTERVAL_MS = Number(
-    process.env.POLL_INTERVAL_MS || "3000"
-  );
+  try {
+    const {
+      BROWSERLESS_HTTP_BASE,
+      BROWSERLESS_TOKEN,
+      AMILIA_EMAIL,
+      AMILIA_PASSWORD,
+    } = process.env;
 
-  // === OVERRIDES (request body) ===
-  const body = req.body || {};
+    if (!BROWSERLESS_HTTP_BASE || !BROWSERLESS_TOKEN) {
+      return res.status(500).json({
+        error: "Browserless HTTP not configured",
+        missing: {
+          BROWSERLESS_HTTP_BASE: !BROWSERLESS_HTTP_BASE,
+          BROWSERLESS_TOKEN: !BROWSERLESS_TOKEN,
+        },
+      });
+    }
 
-  const targetDay = body.targetDay ?? DEFAULT_TARGET_DAY;
-  const eveningStart = body.eveningStart ?? DEFAULT_EVENING_START;
-  const eveningEnd = body.eveningEnd ?? DEFAULT_EVENING_END;
-  const timeZone = body.timeZone ?? DEFAULT_TIMEZONE;
-  const activityUrl = body.activityUrl ?? DEFAULT_ACTIVITY_URL;
-  const dryRun =
-    typeof body.dryRun === "boolean" ? body.dryRun : DEFAULT_DRY_RUN;
-  const pollSeconds = Number.isFinite(Number(body.pollSeconds))
-    ? Number(body.pollSeconds)
-    : DEFAULT_POLL_SECONDS;
-  const pollIntervalMs = Number.isFinite(Number(body.pollIntervalMs))
-    ? Number(body.pollIntervalMs)
-    : DEFAULT_POLL_INTERVAL_MS;
+    if (!AMILIA_EMAIL || !AMILIA_PASSWORD) {
+      return res.status(500).json({
+        error: "Amilia credentials not configured",
+        missing: {
+          AMILIA_EMAIL: !AMILIA_EMAIL,
+          AMILIA_PASSWORD: !AMILIA_PASSWORD,
+        },
+      });
+    }
 
-  const rule = {
-    targetDay,
-    eveningStart,
-    eveningEnd,
-    timeZone,
-    activityUrl,
-    dryRun,
-    pollSeconds,
-    pollIntervalMs,
-  };
+    // === DEFAULTS (Cloud Run env vars) ===
+    const DEFAULT_TARGET_DAY = process.env.TARGET_DAY || "Saturday";
+    const DEFAULT_EVENING_START = process.env.EVENING_START || "13:00";
+    const DEFAULT_EVENING_END = process.env.EVENING_END || "20:00";
+    const DEFAULT_TIMEZONE = process.env.LOCAL_TZ || "America/Toronto";
+    const DEFAULT_ACTIVITY_URL =
+      process.env.ACTIVITY_URL ||
+      "https://app.amilia.com/store/en/ville-de-quebec1/shop/programs/calendar/126867?view=basicWeek&scrollToCalendar=true";
+    const DEFAULT_DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+    const DEFAULT_POLL_SECONDS = Number(process.env.POLL_SECONDS || "120");
+    const DEFAULT_POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || "5000");
 
-  // === VALIDATION ===
-  if (!VALID_DAYS.includes(rule.targetDay)) {
-    return res.status(400).json({
-      error: "Invalid targetDay",
-      provided: rule.targetDay,
-      allowed: VALID_DAYS,
-      rule,
-    });
-  }
+    // === OVERRIDES (request body) ===
+    const body = req.body || {};
 
-  if (!isValidHHMM(rule.eveningStart) || !isValidHHMM(rule.eveningEnd)) {
-    return res.status(400).json({
-      error: "Invalid eveningStart/eveningEnd (expected HH:MM)",
-      provided: { eveningStart: rule.eveningStart, eveningEnd: rule.eveningEnd },
-      examples: ["13:00", "18:30", "21:00"],
-      rule,
-    });
-  }
+    const targetDay = body.targetDay ?? DEFAULT_TARGET_DAY;
+    const eveningStart = body.eveningStart ?? DEFAULT_EVENING_START;
+    const eveningEnd = body.eveningEnd ?? DEFAULT_EVENING_END;
+    const timeZone = body.timeZone ?? DEFAULT_TIMEZONE;
+    const activityUrl = body.activityUrl ?? DEFAULT_ACTIVITY_URL;
+    const dryRun = typeof body.dryRun === "boolean" ? body.dryRun : DEFAULT_DRY_RUN;
+    const pollSeconds =
+      Number.isFinite(Number(body.pollSeconds)) ? Number(body.pollSeconds) : DEFAULT_POLL_SECONDS;
+    const pollIntervalMs =
+      Number.isFinite(Number(body.pollIntervalMs)) ? Number(body.pollIntervalMs) : DEFAULT_POLL_INTERVAL_MS;
 
-  if (!isValidCalendarUrl(rule.activityUrl)) {
-    return res.status(400).json({
-      error:
-        "Invalid activityUrl (must include /shop/activities/ OR /shop/programs/calendar/)",
-      provided: rule.activityUrl,
-      examplePrograms:
-        "https://app.amilia.com/store/en/ville-de-quebec1/shop/programs/calendar/126867?view=basicWeek&scrollToCalendar=true&date=2025-12-27",
-      exampleActivities:
-        "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6112282?scrollToCalendar=true&view=month",
-      rule,
-    });
-  }
+    const rule = {
+      targetDay,
+      eveningStart,
+      eveningEnd,
+      timeZone,
+      activityUrl,
+      dryRun,
+      pollSeconds,
+      pollIntervalMs,
+    };
 
-  const functionUrl = `${normalizeBaseUrl(
-    BROWSERLESS_HTTP_BASE
-  )}/function?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
+    // === VALIDATION ===
+    if (!VALID_DAYS.includes(rule.targetDay)) {
+      return res.status(400).json({
+        error: "Invalid targetDay",
+        provided: rule.targetDay,
+        allowed: VALID_DAYS,
+        rule,
+      });
+    }
 
-  /**
-   * Browserless Function API = Puppeteer-like runtime.
-   * No page.waitForTimeout(). Use sleep().
-   */
-  const code = `
+    if (!isValidHHMM(rule.eveningStart) || !isValidHHMM(rule.eveningEnd)) {
+      return res.status(400).json({
+        error: "Invalid eveningStart/eveningEnd (expected HH:MM)",
+        provided: { eveningStart: rule.eveningStart, eveningEnd: rule.eveningEnd },
+        examples: ["13:00", "18:30", "21:00"],
+        rule,
+      });
+    }
+
+    if (!isValidCalendarUrl(rule.activityUrl)) {
+      return res.status(400).json({
+        error: "Invalid activityUrl (must include /shop/activities/ OR /shop/programs/calendar/)",
+        provided: rule.activityUrl,
+        examplePrograms:
+          "https://app.amilia.com/store/en/ville-de-quebec1/shop/programs/calendar/126867?view=basicWeek&scrollToCalendar=true&date=2025-12-27",
+        exampleActivities:
+          "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6112282?scrollToCalendar=true&view=month",
+        rule,
+      });
+    }
+
+    const functionUrl = `${normalizeBaseUrl(BROWSERLESS_HTTP_BASE)}/function?token=${encodeURIComponent(
+      BROWSERLESS_TOKEN
+    )}`;
+
+    // --- Browserless Function code ---
+    const code = `
 export default async function ({ page, context }) {
   const {
     EMAIL,
@@ -234,10 +239,12 @@ export default async function ({ page, context }) {
     return Number(m[1]) * 60 + Number(m[2]);
   };
 
-  const normalizeText = (s) => String(s || "").replace(/\\s+/g, " ").trim();
-
   const windowStartMin = hhmmToMinutes(EVENING_START);
   const windowEndMin = hhmmToMinutes(EVENING_END);
+
+  const isRealSuccess = (url) => {
+    return /[?&]quickRegisterId=\\d+/.test(url) || /\\/cart\\b/i.test(url) || /\\/checkout\\b/i.test(url);
+  };
 
   // -------- 1) Login --------
   await page.goto("https://app.amilia.com/en/login", {
@@ -274,29 +281,17 @@ export default async function ({ page, context }) {
   const maxAttempts = Math.max(1, Math.floor((Number(POLL_SECONDS) * 1000) / Number(POLL_INTERVAL_MS)));
   let attempts = 0;
 
-  // ✅ STRICT success detection (no generic "cart" text)
   const getState = async () => {
     return await page.evaluate(() => {
       const normalize = (s) => String(s || "").replace(/\\s+/g, " ").trim();
       const bodyText = normalize(document.body?.innerText || "");
       const url = location.href;
 
-      const hasQuickReg = /[?&]quickRegisterId=\\d+/.test(url);
-
-      // Only count as cart/checkout if URL indicates it OR strong phrases exist
-      const hasCartCue =
-        /\\/cart\\b/i.test(url) ||
-        /\\/checkout\\b/i.test(url) ||
-        /my cart/i.test(bodyText) ||
-        /cart summary/i.test(bodyText) ||
-        /order summary/i.test(bodyText);
-
       const cannotRegister = /cannot register/i.test(bodyText);
       const notOpenedYet = /registration has not yet been opened/i.test(bodyText);
 
       return {
         url,
-        success: Boolean(hasQuickReg || hasCartCue),
         cannotRegister,
         notOpenedYet
       };
@@ -332,7 +327,6 @@ export default async function ({ page, context }) {
         return true;
       };
 
-      // Focus on event tiles / segments
       const eventContainers = Array.from(document.querySelectorAll(
         ".fc-event, .fc-day-grid-event, .fc-time-grid-event, .activity-segment, [id^='event-title-']"
       ));
@@ -350,7 +344,6 @@ export default async function ({ page, context }) {
       const parseStartMinutes = (text) => {
         const s = text.toLowerCase();
 
-        // 12h: 7:00 pm
         let m = s.match(/\\b(\\d{1,2}):(\\d{2})\\s*(am|pm)\\b/);
         if (m) {
           let hh = Number(m[1]);
@@ -361,7 +354,6 @@ export default async function ({ page, context }) {
           return hh * 60 + mm;
         }
 
-        // 24h: 19:00
         m = s.match(/\\b([01]?\\d|2[0-3]):([0-5]\\d)\\b/);
         if (m) return Number(m[1]) * 60 + Number(m[2]);
 
@@ -391,30 +383,21 @@ export default async function ({ page, context }) {
   };
 
   let lastClick = null;
-  let lastState = await getState();
+  let state = await getState();
 
-  // If already success, return (rare)
-  if (lastState.success) {
-    return {
-      data: {
-        status: "POLLING_DONE",
-        url: lastState.url,
-        attempts: 0,
-        finalState: lastState,
-        clickResult: { outcome: "SUCCESS_ALREADY", attempts: 0, state: lastState }
-      },
-      type: "application/json"
-    };
+  // DO NOT claim success unless URL truly indicates it
+  if (isRealSuccess(state.url)) {
+    return { data: { status: "BOOKING_CONFIRMED", attempts: 0, finalState: state }, type: "application/json" };
   }
 
   // -------- 3) Poll loop --------
   while (attempts < maxAttempts) {
     attempts += 1;
 
-    lastState = await getState();
-    if (lastState.success) break;
+    state = await getState();
+    if (isRealSuccess(state.url)) break;
 
-    if (lastState.cannotRegister || lastState.notOpenedYet) {
+    if (state.cannotRegister || state.notOpenedYet) {
       await closeModalIfPresent();
       await sleep(Number(POLL_INTERVAL_MS));
       continue;
@@ -428,10 +411,10 @@ export default async function ({ page, context }) {
     lastClick = await pickAndClickCalendarRegister();
     await sleep(1200);
 
-    lastState = await getState();
-    if (lastState.success) break;
+    state = await getState();
+    if (isRealSuccess(state.url)) break;
 
-    if (lastState.cannotRegister || lastState.notOpenedYet) {
+    if (state.cannotRegister || state.notOpenedYet) {
       await closeModalIfPresent();
     }
 
@@ -439,113 +422,105 @@ export default async function ({ page, context }) {
   }
 
   const finalState = await getState();
-  const outcome =
-    finalState.success ? "SUCCESS_CLICKED" :
-    (attempts >= maxAttempts ? "TIMEOUT" : "STOPPED");
+  const finalSuccess = isRealSuccess(finalState.url);
 
   return {
     data: {
-      status: "POLLING_DONE",
-      url: finalState.url,
+      status: finalSuccess ? "BOOKING_CONFIRMED" : "POLLING_DONE",
       attempts,
       finalState,
-      clickResult: lastClick ? { outcome, attempts, lastClick, state: finalState } : { outcome, attempts, state: finalState }
+      clickResult: lastClick ? { outcome: finalSuccess ? "SUCCESS_CLICKED" : "NO_SUCCESS", attempts, lastClick, state: finalState }
+                             : { outcome: finalSuccess ? "SUCCESS_NOCLICK" : "NO_CLICK", attempts, state: finalState }
     },
     type: "application/json"
   };
 }
 `.trim();
 
-  // Cloud Run -> Browserless HTTP call timeout
-  const controller = new AbortController();
+    // Keep AbortController slightly less than Cloud Run request timeout (you have 300s)
+    const controller = new AbortController();
+    const timeoutMs = 285000; // 4m45s
+    const t = setTimeout(() => controller.abort(), timeoutMs);
 
-  // IMPORTANT: keep this slightly LESS than Cloud Run request timeout
-  const timeoutMs = 290000; // ~4m50s
-  const t = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const payloadToSend = {
+        code,
+        context: {
+          EMAIL: AMILIA_EMAIL,
+          PASSWORD: AMILIA_PASSWORD,
+          EVENING_START: rule.eveningStart,
+          EVENING_END: rule.eveningEnd,
+          ACTIVITY_URL: rule.activityUrl,
+          DRY_RUN: rule.dryRun,
+          POLL_SECONDS: rule.pollSeconds,
+          POLL_INTERVAL_MS: rule.pollIntervalMs,
+        },
+      };
 
-  try {
-    const resp = await fetchWithRetry(
-      functionUrl,
-      {
+      const { resp, text } = await fetchWithRetry(functionUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: controller.signal,
-        body: JSON.stringify({
-          code,
-          context: {
-            EMAIL: AMILIA_EMAIL,
-            PASSWORD: AMILIA_PASSWORD,
-            EVENING_START: rule.eveningStart,
-            EVENING_END: rule.eveningEnd,
-            ACTIVITY_URL: rule.activityUrl,
-            DRY_RUN: rule.dryRun,
-            POLL_SECONDS: rule.pollSeconds,
-            POLL_INTERVAL_MS: rule.pollIntervalMs,
-          },
-        }),
-      },
-      { retries: 6, baseDelayMs: 1500 }
-    );
+        body: JSON.stringify(payloadToSend),
+      }, {
+        maxAttempts: 4,       // Handles 429 nicely
+        baseDelayMs: 1200,
+        maxDelayMs: 12000,
+      });
 
-    const text = await resp.text();
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = { raw: text };
+      }
 
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      parsed = { raw: text };
-    }
+      if (!resp.ok) {
+        console.log("BROWSERLESS_ERROR_BODY", JSON.stringify(parsed).slice(0, 4000));
+        return res.status(502).json({
+          error: "Browserless Function API error",
+          httpStatus: resp.status,
+          body: parsed,
+          rule,
+        });
+      }
 
-    if (!resp.ok) {
-      console.log("BROWSERLESS_ERROR_STATUS", resp.status);
-      console.log("BROWSERLESS_ERROR_BODY", JSON.stringify(parsed).slice(0, 4000));
-      return res.status(502).json({
-        error: "Browserless Function API error",
-        httpStatus: resp.status,
-        body: parsed,
+      const browserlessPayload = parsed?.data?.data || parsed?.data || parsed;
+
+      console.log("[BOOK] Browserless response:", JSON.stringify(browserlessPayload).slice(0, 2000));
+      console.log("BOOK_SUMMARY", JSON.stringify({
+        attempts: browserlessPayload?.attempts,
+        status: browserlessPayload?.status,
+        outcome: browserlessPayload?.clickResult?.outcome,
+        clicked: browserlessPayload?.clickResult?.lastClick?.clicked,
+        finalUrl: browserlessPayload?.finalState?.url
+      }));
+
+      console.log("BOOK_RESULT", JSON.stringify({
+        status: "BROWSERLESS_HTTP_OK",
+        rule,
+        browserless: browserlessPayload,
+      }));
+
+      return res.json({
+        status: "BROWSERLESS_HTTP_OK",
+        browserless: parsed,
         rule,
       });
+
+    } catch (err) {
+      const isAbort = err?.name === "AbortError";
+      return res.status(504).json({
+        error: isAbort ? "Browserless HTTP request timed out" : "Browserless HTTP request failed",
+        details: String(err?.message || err),
+      });
+    } finally {
+      clearTimeout(t);
     }
 
-    // Keep logs short + useful
-    const payload = parsed?.data?.data || parsed?.data || parsed;
-
-    console.log("[BOOK] Browserless response:", JSON.stringify(payload).slice(0, 2000));
-
-    console.log("BOOK_SUMMARY", JSON.stringify({
-      attempts: payload?.attempts,
-      outcome: payload?.clickResult?.outcome,
-      clicked: payload?.clickResult?.lastClick?.clicked,
-      finalSuccess: payload?.finalState?.success,
-      finalUrl: payload?.finalState?.url
-    }));
-
-    console.log("BOOK_RESULT", JSON.stringify({
-      status: "BROWSERLESS_HTTP_OK",
-      rule,
-      browserless: payload
-    }));
-
-    return res.json({
-      status: "BROWSERLESS_HTTP_OK",
-      browserless: parsed,
-      rule,
-    });
-  } catch (err) {
-    const isAbort = err?.name === "AbortError";
-    console.log("BROWSERLESS_FATAL_ERROR", String(err?.message || err));
-    if (err?.lastText) {
-      console.log("BROWSERLESS_FATAL_LAST_TEXT", String(err.lastText).slice(0, 2000));
-    }
-    return res.status(504).json({
-      error: isAbort
-        ? "Browserless HTTP request timed out"
-        : "Browserless HTTP request failed after retries",
-      details: String(err?.message || err),
-      rule,
-    });
   } finally {
-    clearTimeout(t);
+    RUNNING = false;
+    RUNNING_SINCE = null;
   }
 });
 
