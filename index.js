@@ -19,10 +19,17 @@ function requireApiKey(req, res) {
   return true;
 }
 
-const VALID_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const VALID_DAYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
 
 function isValidHHMM(v) {
-  // Accepts "H:MM" or "HH:MM"
   return /^([01]?\d|2[0-3]):[0-5]\d$/.test(v || "");
 }
 
@@ -39,7 +46,12 @@ function isValidCalendarUrl(u) {
 app.post("/book", async (req, res) => {
   if (!requireApiKey(req, res)) return;
 
-  const { BROWSERLESS_HTTP_BASE, BROWSERLESS_TOKEN, AMILIA_EMAIL, AMILIA_PASSWORD } = process.env;
+  const {
+    BROWSERLESS_HTTP_BASE,
+    BROWSERLESS_TOKEN,
+    AMILIA_EMAIL,
+    AMILIA_PASSWORD,
+  } = process.env;
 
   if (!BROWSERLESS_HTTP_BASE || !BROWSERLESS_TOKEN) {
     return res.status(500).json({
@@ -61,10 +73,10 @@ app.post("/book", async (req, res) => {
     });
   }
 
-  // === DEFAULTS (from Cloud Run env vars) ===
+  // === DEFAULTS (Cloud Run env vars) ===
   const DEFAULT_TARGET_DAY = process.env.TARGET_DAY || "Saturday";
-  const DEFAULT_EVENING_START = process.env.EVENING_START || "18:00";
-  const DEFAULT_EVENING_END = process.env.EVENING_END || "21:00";
+  const DEFAULT_EVENING_START = process.env.EVENING_START || "13:00";
+  const DEFAULT_EVENING_END = process.env.EVENING_END || "20:00";
   const DEFAULT_TIMEZONE = process.env.LOCAL_TZ || "America/Toronto";
   const DEFAULT_ACTIVITY_URL =
     process.env.ACTIVITY_URL ||
@@ -73,7 +85,7 @@ app.post("/book", async (req, res) => {
   const DEFAULT_POLL_SECONDS = Number(process.env.POLL_SECONDS || "90");
   const DEFAULT_POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || "3000");
 
-  // === OVERRIDES (from request body) ===
+  // === OVERRIDES (request body) ===
   const body = req.body || {};
 
   const targetDay = body.targetDay ?? DEFAULT_TARGET_DAY;
@@ -85,9 +97,7 @@ app.post("/book", async (req, res) => {
   const pollSeconds =
     Number.isFinite(Number(body.pollSeconds)) ? Number(body.pollSeconds) : DEFAULT_POLL_SECONDS;
   const pollIntervalMs =
-    Number.isFinite(Number(body.pollIntervalMs))
-      ? Number(body.pollIntervalMs)
-      : DEFAULT_POLL_INTERVAL_MS;
+    Number.isFinite(Number(body.pollIntervalMs)) ? Number(body.pollIntervalMs) : DEFAULT_POLL_INTERVAL_MS;
 
   const rule = {
     targetDay,
@@ -144,10 +154,8 @@ export default async function ({ page, context }) {
   const {
     EMAIL,
     PASSWORD,
-    TARGET_DAY,
     EVENING_START,
     EVENING_END,
-    TIME_ZONE,
     ACTIVITY_URL,
     DRY_RUN,
     POLL_SECONDS,
@@ -203,8 +211,7 @@ export default async function ({ page, context }) {
   const maxAttempts = Math.max(1, Math.floor((Number(POLL_SECONDS) * 1000) / Number(POLL_INTERVAL_MS)));
   let attempts = 0;
 
-  // STRICT success detection:
-  // Only treat as success if we entered quick-register or cart/checkout flows (URL-based).
+  // ✅ STRICT success detection (no generic "cart" text)
   const getState = async () => {
     return await page.evaluate(() => {
       const normalize = (s) => String(s || "").replace(/\\s+/g, " ").trim();
@@ -212,18 +219,21 @@ export default async function ({ page, context }) {
       const url = location.href;
 
       const hasQuickReg = /[?&]quickRegisterId=\\d+/.test(url);
-      const onCart = /\\/cart\\b/i.test(url);
-      const onCheckout = /\\/checkout\\b/i.test(url);
+
+      // Only count as cart/checkout if URL indicates it OR strong phrases exist
+      const hasCartCue =
+        /\\/cart\\b/i.test(url) ||
+        /\\/checkout\\b/i.test(url) ||
+        /my cart/i.test(bodyText) ||
+        /cart summary/i.test(bodyText) ||
+        /order summary/i.test(bodyText);
 
       const cannotRegister = /cannot register/i.test(bodyText);
       const notOpenedYet = /registration has not yet been opened/i.test(bodyText);
 
       return {
         url,
-        hasQuickReg,
-        onCart,
-        onCheckout,
-        success: Boolean(hasQuickReg || onCart || onCheckout),
+        success: Boolean(hasQuickReg || hasCartCue),
         cannotRegister,
         notOpenedYet
       };
@@ -259,7 +269,7 @@ export default async function ({ page, context }) {
         return true;
       };
 
-      // Only consider Register buttons inside calendar/event containers (ignore nav/menu)
+      // Focus on event tiles / segments
       const eventContainers = Array.from(document.querySelectorAll(
         ".fc-event, .fc-day-grid-event, .fc-time-grid-event, .activity-segment, [id^='event-title-']"
       ));
@@ -302,7 +312,7 @@ export default async function ({ page, context }) {
 
       const pick = filtered[0] || candidates[0] || null;
       if (!pick) {
-        return { clicked: false, reason: "NO_REGISTER_IN_CALENDAR", candidatesFound: candidates.length, filteredFound: filtered.length };
+        return { clicked: false, reason: "NO_REGISTER_FOUND", candidatesFound: candidates.length, filteredFound: filtered.length };
       }
 
       pick.btn.click();
@@ -317,35 +327,24 @@ export default async function ({ page, context }) {
     }, { windowStartMin, windowEndMin });
   };
 
-  // If already success (rare), return (STRICT now)
-  const initial = await getState();
-  if (initial.success) {
+  let lastClick = null;
+  let lastState = await getState();
+
+  // NOTE: We no longer instantly return SUCCESS_ALREADY unless strict condition hit
+  // This avoids false positives.
+  // If already success, return (rare)
+  if (lastState.success) {
     return {
       data: {
         status: "POLLING_DONE",
-        url: initial.url,
+        url: lastState.url,
         attempts: 0,
-        finalState: initial,
-        clickResult: { outcome: "SUCCESS_ALREADY", attempts: 0, state: initial },
-        rule: {
-          targetDay: TARGET_DAY,
-          eveningStart: EVENING_START,
-          eveningEnd: EVENING_END,
-          timeZone: TIME_ZONE,
-          activityUrl: ACTIVITY_URL,
-          dryRun: DRY_RUN,
-          pollSeconds: POLL_SECONDS,
-          pollIntervalMs: POLL_INTERVAL_MS,
-          eveningStartMin: windowStartMin,
-          eveningEndMin: windowEndMin
-        }
+        finalState: lastState,
+        clickResult: { outcome: "SUCCESS_ALREADY", attempts: 0, state: lastState }
       },
       type: "application/json"
     };
   }
-
-  let lastClick = null;
-  let lastState = initial;
 
   // -------- 3) Poll loop --------
   while (attempts < maxAttempts) {
@@ -366,18 +365,9 @@ export default async function ({ page, context }) {
     }
 
     lastClick = await pickAndClickCalendarRegister();
+    await sleep(1200);
 
-    // small wait for SPA navigation to settle
-    await sleep(800);
-
-    // extra short loop to catch delayed quickRegister/cart transitions
-    for (let i = 0; i < 5; i++) {
-      await sleep(500);
-      const s = await getState();
-      if (s.success) { lastState = s; break; }
-      lastState = s;
-    }
-
+    lastState = await getState();
     if (lastState.success) break;
 
     if (lastState.cannotRegister || lastState.notOpenedYet) {
@@ -398,19 +388,7 @@ export default async function ({ page, context }) {
       url: finalState.url,
       attempts,
       finalState,
-      clickResult: lastClick ? { outcome, attempts, lastClick, state: finalState } : { outcome, attempts, state: finalState },
-      rule: {
-        targetDay: TARGET_DAY,
-        eveningStart: EVENING_START,
-        eveningEnd: EVENING_END,
-        timeZone: TIME_ZONE,
-        activityUrl: ACTIVITY_URL,
-        dryRun: DRY_RUN,
-        pollSeconds: POLL_SECONDS,
-        pollIntervalMs: POLL_INTERVAL_MS,
-        eveningStartMin: windowStartMin,
-        eveningEndMin: windowEndMin
-      }
+      clickResult: lastClick ? { outcome, attempts, lastClick, state: finalState } : { outcome, attempts, state: finalState }
     },
     type: "application/json"
   };
@@ -419,7 +397,9 @@ export default async function ({ page, context }) {
 
   // Cloud Run -> Browserless HTTP call timeout
   const controller = new AbortController();
-  const timeoutMs = 240000; // 4 minutes to allow polling
+
+  // IMPORTANT: keep this slightly LESS than Cloud Run request timeout
+  const timeoutMs = 290000; // ~4m50s
   const t = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
@@ -432,10 +412,8 @@ export default async function ({ page, context }) {
         context: {
           EMAIL: AMILIA_EMAIL,
           PASSWORD: AMILIA_PASSWORD,
-          TARGET_DAY: rule.targetDay,
           EVENING_START: rule.eveningStart,
           EVENING_END: rule.eveningEnd,
-          TIME_ZONE: rule.timeZone,
           ACTIVITY_URL: rule.activityUrl,
           DRY_RUN: rule.dryRun,
           POLL_SECONDS: rule.pollSeconds,
@@ -454,6 +432,7 @@ export default async function ({ page, context }) {
     }
 
     if (!resp.ok) {
+      console.log("BROWSERLESS_ERROR_BODY", JSON.stringify(parsed).slice(0, 4000));
       return res.status(502).json({
         error: "Browserless Function API error",
         httpStatus: resp.status,
@@ -462,16 +441,24 @@ export default async function ({ page, context }) {
       });
     }
 
-    // Helpful server-side log line for Cloud Run logs
-    console.log("[BOOK] Browserless response:", JSON.stringify(parsed?.data || parsed).slice(0, 2000));
-    console.log(
-      "BOOK_RESULT",
-      JSON.stringify({
-        status: "BROWSERLESS_HTTP_OK",
-        rule,
-        browserless: parsed?.data?.data || parsed?.data || parsed,
-      })
-    );
+    // Keep logs short + useful
+    const payload = parsed?.data?.data || parsed?.data || parsed;
+
+    console.log("[BOOK] Browserless response:", JSON.stringify(payload).slice(0, 2000));
+
+    console.log("BOOK_SUMMARY", JSON.stringify({
+      attempts: payload?.attempts,
+      outcome: payload?.clickResult?.outcome,
+      clicked: payload?.clickResult?.lastClick?.clicked,
+      finalSuccess: payload?.finalState?.success,
+      finalUrl: payload?.finalState?.url
+    }));
+
+    console.log("BOOK_RESULT", JSON.stringify({
+      status: "BROWSERLESS_HTTP_OK",
+      rule,
+      browserless: payload
+    }));
 
     return res.json({
       status: "BROWSERLESS_HTTP_OK",
@@ -491,5 +478,5 @@ export default async function ({ page, context }) {
 });
 
 app.listen(PORT, () => {
-  console.log(\`Server running on port \${PORT}\`);
+  console.log(`Server running on port ${PORT}`);
 });
