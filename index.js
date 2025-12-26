@@ -5,14 +5,11 @@ app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 8080;
 
-// ---- Simple in-memory lock (prevents parallel Browserless calls) ----
-// Cloud Run can handle concurrent requests; you do NOT want two scheduler jobs hitting browserless at once.
-let RUNNING = false;
-let RUNNING_SINCE = null;
+// ---- Simple in-instance lock to avoid parallel runs on same container ----
+let isRunning = false;
 
-app.get("/", (req, res) => {
-  res.json({ status: "ok" });
-});
+// Health check
+app.get("/", (req, res) => res.json({ status: "ok" }));
 
 function requireApiKey(req, res) {
   const apiKey = req.headers["x-api-key"];
@@ -42,79 +39,130 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function jitter(ms) {
-  const delta = Math.floor(ms * 0.2);
-  return ms + Math.floor(Math.random() * (delta * 2 + 1)) - delta;
-}
+/**
+ * Fetch with retry/backoff.
+ * Retries: 429, 5xx, 408, 409, 425, 504, network errors, timeouts.
+ * Uses Retry-After header when present (for 429).
+ */
+async function fetchWithRetry(url, options, cfg) {
+  const {
+    maxAttempts = 8,
+    baseDelayMs = 1500,
+    maxDelayMs = 15000,
+    maxTotalMs = 240000, // total budget across retries
+    logPrefix = "BROWSERLESS",
+  } = cfg || {};
 
-// Retry only for transient Browserless errors (429, 5xx, timeouts)
-async function fetchWithRetry(url, options, {
-  maxAttempts = 4,
-  baseDelayMs = 1200,
-  maxDelayMs = 12000
-} = {}) {
+  const started = Date.now();
+  let attempt = 0;
   let lastErr = null;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  while (attempt < maxAttempts && Date.now() - started < maxTotalMs) {
+    attempt += 1;
+
+    // per-attempt timeout (keep it short; we retry)
+    const controller = new AbortController();
+    const perAttemptTimeoutMs = Math.min(60000, Math.max(15000, maxTotalMs - (Date.now() - started)));
+    const t = setTimeout(() => controller.abort(), perAttemptTimeoutMs);
+
     try {
-      const resp = await fetch(url, options);
+      const resp = await fetch(url, { ...options, signal: controller.signal });
 
-      // Retry on 429 and 5xx
-      if (resp.status === 429 || (resp.status >= 500 && resp.status <= 599)) {
-        const bodyText = await resp.text().catch(() => "");
-        const delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
-        const waitMs = jitter(delay);
-
-        console.log("BROWSERLESS_TRANSIENT_HTTP", JSON.stringify({
-          attempt,
-          status: resp.status,
-          waitMs,
-          bodyPreview: bodyText.slice(0, 300)
-        }));
-
-        if (attempt === maxAttempts) {
-          return { resp, text: bodyText };
-        }
-
-        await sleep(waitMs);
-        continue;
+      // Success path
+      if (resp.ok) {
+        return resp;
       }
 
-      const text = await resp.text();
-      return { resp, text };
+      // Read body for logging / debugging
+      const bodyText = await resp.text().catch(() => "");
+      const status = resp.status;
 
-    } catch (err) {
-      lastErr = err;
-      const delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
-      const waitMs = jitter(delay);
+      const retryableStatuses = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+      const retryable = retryableStatuses.has(status);
 
-      console.log("BROWSERLESS_TRANSIENT_ERR", JSON.stringify({
-        attempt,
-        waitMs,
-        message: String(err?.message || err)
-      }));
+      console.log(
+        `${logPrefix}_HTTP_${status}`,
+        JSON.stringify({
+          attempt,
+          perAttemptTimeoutMs,
+          retryable,
+          retryAfter: resp.headers.get("retry-after") || null,
+          bodySnippet: bodyText?.slice(0, 300) || "",
+        })
+      );
 
-      if (attempt === maxAttempts) throw lastErr;
-      await sleep(waitMs);
+      if (!retryable) {
+        // Not retryable -> return immediately
+        // Re-create a response-like object for caller
+        return new Response(bodyText, { status, headers: resp.headers });
+      }
+
+      // If 429 and Retry-After exists, respect it (seconds)
+      let delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
+      const retryAfter = resp.headers.get("retry-after");
+      if (retryAfter) {
+        const sec = Number(retryAfter);
+        if (Number.isFinite(sec) && sec > 0) delay = Math.min(maxDelayMs, sec * 1000);
+      }
+
+      // add jitter
+      delay = Math.floor(delay * (0.7 + Math.random() * 0.6));
+
+      // If we are out of budget, break
+      if (Date.now() - started + delay > maxTotalMs) break;
+
+      await sleep(delay);
+      continue;
+    } catch (e) {
+      lastErr = e;
+      const name = e?.name || "Error";
+      const msg = String(e?.message || e);
+
+      const retryable = name === "AbortError" || /network|fetch|timeout|ECONNRESET|ENOTFOUND|EAI_AGAIN/i.test(msg);
+
+      console.log(
+        `${logPrefix}_ERR`,
+        JSON.stringify({
+          attempt,
+          perAttemptTimeoutMs,
+          retryable,
+          name,
+          message: msg,
+        })
+      );
+
+      if (!retryable) throw e;
+
+      let delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
+      delay = Math.floor(delay * (0.7 + Math.random() * 0.6));
+
+      if (Date.now() - started + delay > maxTotalMs) break;
+
+      await sleep(delay);
+      continue;
+    } finally {
+      clearTimeout(t);
     }
   }
 
-  throw lastErr || new Error("fetchWithRetry failed");
+  // If we reach here, we exhausted retry budget
+  const elapsed = Date.now() - started;
+  const message = lastErr ? String(lastErr?.message || lastErr) : "Retry budget exceeded";
+  const err = new Error(`fetchWithRetry failed after ${attempt} attempt(s) in ${elapsed}ms: ${message}`);
+  err.code = "RETRY_BUDGET_EXCEEDED";
+  throw err;
 }
 
 app.post("/book", async (req, res) => {
   if (!requireApiKey(req, res)) return;
 
-  // Optional: reject if already running (prevents double scheduler jobs colliding)
-  if (RUNNING) {
-    return res.status(409).json({
-      error: "Another booking run is already in progress",
-      runningSince: RUNNING_SINCE,
-    });
+  // Prevent parallel /book calls per-instance (helps avoid rate-limits)
+  if (isRunning) {
+    // Return 429 so Scheduler can retry
+    return res.status(429).json({ error: "Busy (booking already running). Retry later." });
   }
 
-  RUNNING = true;
-  RUNNING_SINCE = new Date().toISOString();
+  isRunning = true;
 
   try {
     const {
@@ -151,14 +199,13 @@ app.post("/book", async (req, res) => {
     const DEFAULT_TIMEZONE = process.env.LOCAL_TZ || "America/Toronto";
     const DEFAULT_ACTIVITY_URL =
       process.env.ACTIVITY_URL ||
-      "https://app.amilia.com/store/en/ville-de-quebec1/shop/programs/calendar/126867?view=basicWeek&scrollToCalendar=true";
+      "https://app.amilia.com/store/en/ville-de-quebec1/shop/programs/calendar/126867?view=basicWeek&scrollToCalendar=true&date=2025-12-27";
     const DEFAULT_DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
-    const DEFAULT_POLL_SECONDS = Number(process.env.POLL_SECONDS || "120");
-    const DEFAULT_POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || "5000");
+    const DEFAULT_POLL_SECONDS = Number(process.env.POLL_SECONDS || "240");
+    const DEFAULT_POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || "2000");
 
     // === OVERRIDES (request body) ===
     const body = req.body || {};
-
     const targetDay = body.targetDay ?? DEFAULT_TARGET_DAY;
     const eveningStart = body.eveningStart ?? DEFAULT_EVENING_START;
     const eveningEnd = body.eveningEnd ?? DEFAULT_EVENING_END;
@@ -216,7 +263,7 @@ app.post("/book", async (req, res) => {
       BROWSERLESS_TOKEN
     )}`;
 
-    // --- Browserless Function code ---
+    // Browserless Function Code (strict success detection; clicks register in event tiles)
     const code = `
 export default async function ({ page, context }) {
   const {
@@ -242,11 +289,7 @@ export default async function ({ page, context }) {
   const windowStartMin = hhmmToMinutes(EVENING_START);
   const windowEndMin = hhmmToMinutes(EVENING_END);
 
-  const isRealSuccess = (url) => {
-    return /[?&]quickRegisterId=\\d+/.test(url) || /\\/cart\\b/i.test(url) || /\\/checkout\\b/i.test(url);
-  };
-
-  // -------- 1) Login --------
+  // 1) Login
   await page.goto("https://app.amilia.com/en/login", {
     waitUntil: "domcontentloaded",
     timeout: 60000
@@ -265,33 +308,40 @@ export default async function ({ page, context }) {
 
   const submitSel = 'button[type="submit"], input[type="submit"]';
   const submit = await page.$(submitSel);
-  if (submit) {
-    await submit.click();
-  } else {
-    await page.focus(passSel);
-    await page.keyboard.press("Enter");
-  }
+  if (submit) await submit.click();
+  else { await page.focus(passSel); await page.keyboard.press("Enter"); }
 
   await page.waitForFunction(() => !location.href.includes("/login"), { timeout: 60000 }).catch(() => {});
 
-  // -------- 2) Go to calendar --------
+  // 2) Go to calendar
   await page.goto(ACTIVITY_URL, { waitUntil: "networkidle2", timeout: 60000 });
   await sleep(1200);
 
   const maxAttempts = Math.max(1, Math.floor((Number(POLL_SECONDS) * 1000) / Number(POLL_INTERVAL_MS)));
   let attempts = 0;
 
+  // STRICT success: only URL cart/checkout OR quickRegisterId OR explicit summaries
   const getState = async () => {
     return await page.evaluate(() => {
       const normalize = (s) => String(s || "").replace(/\\s+/g, " ").trim();
       const bodyText = normalize(document.body?.innerText || "");
       const url = location.href;
 
+      const hasQuickReg = /[?&]quickRegisterId=\\d+/.test(url);
+
+      const hasCartCue =
+        /\\/cart\\b/i.test(url) ||
+        /\\/checkout\\b/i.test(url) ||
+        /cart summary/i.test(bodyText) ||
+        /order summary/i.test(bodyText) ||
+        /my cart/i.test(bodyText);
+
       const cannotRegister = /cannot register/i.test(bodyText);
       const notOpenedYet = /registration has not yet been opened/i.test(bodyText);
 
       return {
         url,
+        success: Boolean(hasQuickReg || hasCartCue),
         cannotRegister,
         notOpenedYet
       };
@@ -336,7 +386,6 @@ export default async function ({ page, context }) {
         const btn = container.querySelector("button.register, a.register, button[title='Register'], a[title='Register']");
         if (!btn) continue;
         if (!isVisible(btn)) continue;
-
         const text = normalize(container.innerText || "");
         candidates.push({ text, btn });
       }
@@ -383,21 +432,28 @@ export default async function ({ page, context }) {
   };
 
   let lastClick = null;
-  let state = await getState();
+  let lastState = await getState();
 
-  // DO NOT claim success unless URL truly indicates it
-  if (isRealSuccess(state.url)) {
-    return { data: { status: "BOOKING_CONFIRMED", attempts: 0, finalState: state }, type: "application/json" };
+  if (lastState.success) {
+    return {
+      data: {
+        status: "POLLING_DONE",
+        url: lastState.url,
+        attempts: 0,
+        finalState: lastState,
+        clickResult: { outcome: "SUCCESS_ALREADY", attempts: 0, state: lastState }
+      },
+      type: "application/json"
+    };
   }
 
-  // -------- 3) Poll loop --------
   while (attempts < maxAttempts) {
     attempts += 1;
 
-    state = await getState();
-    if (isRealSuccess(state.url)) break;
+    lastState = await getState();
+    if (lastState.success) break;
 
-    if (state.cannotRegister || state.notOpenedYet) {
+    if (lastState.cannotRegister || lastState.notOpenedYet) {
       await closeModalIfPresent();
       await sleep(Number(POLL_INTERVAL_MS));
       continue;
@@ -411,10 +467,10 @@ export default async function ({ page, context }) {
     lastClick = await pickAndClickCalendarRegister();
     await sleep(1200);
 
-    state = await getState();
-    if (isRealSuccess(state.url)) break;
+    lastState = await getState();
+    if (lastState.success) break;
 
-    if (state.cannotRegister || state.notOpenedYet) {
+    if (lastState.cannotRegister || lastState.notOpenedYet) {
       await closeModalIfPresent();
     }
 
@@ -422,105 +478,111 @@ export default async function ({ page, context }) {
   }
 
   const finalState = await getState();
-  const finalSuccess = isRealSuccess(finalState.url);
+  const outcome =
+    finalState.success ? "SUCCESS_CLICKED" :
+    (attempts >= maxAttempts ? "TIMEOUT" : "STOPPED");
 
   return {
     data: {
-      status: finalSuccess ? "BOOKING_CONFIRMED" : "POLLING_DONE",
+      status: "POLLING_DONE",
+      url: finalState.url,
       attempts,
       finalState,
-      clickResult: lastClick ? { outcome: finalSuccess ? "SUCCESS_CLICKED" : "NO_SUCCESS", attempts, lastClick, state: finalState }
-                             : { outcome: finalSuccess ? "SUCCESS_NOCLICK" : "NO_CLICK", attempts, state: finalState }
+      clickResult: lastClick ? { outcome, attempts, lastClick, state: finalState } : { outcome, attempts, state: finalState }
     },
     type: "application/json"
   };
 }
 `.trim();
 
-    // Keep AbortController slightly less than Cloud Run request timeout (you have 300s)
-    const controller = new AbortController();
-    const timeoutMs = 285000; // 4m45s
-    const t = setTimeout(() => controller.abort(), timeoutMs);
+    // IMPORTANT: Cloud Run request timeout is ~300s. Keep Browserless retry budget under that.
+    const maxTotalMs = Math.min(240000, Math.max(60000, (rule.pollSeconds * 1000) + 60000));
 
+    const payloadToBrowserless = {
+      code,
+      context: {
+        EMAIL: AMILIA_EMAIL,
+        PASSWORD: AMILIA_PASSWORD,
+        EVENING_START: rule.eveningStart,
+        EVENING_END: rule.eveningEnd,
+        ACTIVITY_URL: rule.activityUrl,
+        DRY_RUN: rule.dryRun,
+        POLL_SECONDS: rule.pollSeconds,
+        POLL_INTERVAL_MS: rule.pollIntervalMs,
+      },
+    };
+
+    console.log("BOOK_START", JSON.stringify({ rule }));
+
+    // Call Browserless with robust retry/backoff
+    let resp;
     try {
-      const payloadToSend = {
-        code,
-        context: {
-          EMAIL: AMILIA_EMAIL,
-          PASSWORD: AMILIA_PASSWORD,
-          EVENING_START: rule.eveningStart,
-          EVENING_END: rule.eveningEnd,
-          ACTIVITY_URL: rule.activityUrl,
-          DRY_RUN: rule.dryRun,
-          POLL_SECONDS: rule.pollSeconds,
-          POLL_INTERVAL_MS: rule.pollIntervalMs,
+      resp = await fetchWithRetry(
+        functionUrl,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payloadToBrowserless),
         },
-      };
-
-      const { resp, text } = await fetchWithRetry(functionUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify(payloadToSend),
-      }, {
-        maxAttempts: 4,       // Handles 429 nicely
-        baseDelayMs: 1200,
-        maxDelayMs: 12000,
-      });
-
-      let parsed;
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        parsed = { raw: text };
-      }
-
-      if (!resp.ok) {
-        console.log("BROWSERLESS_ERROR_BODY", JSON.stringify(parsed).slice(0, 4000));
-        return res.status(502).json({
-          error: "Browserless Function API error",
-          httpStatus: resp.status,
-          body: parsed,
-          rule,
-        });
-      }
-
-      const browserlessPayload = parsed?.data?.data || parsed?.data || parsed;
-
-      console.log("[BOOK] Browserless response:", JSON.stringify(browserlessPayload).slice(0, 2000));
-      console.log("BOOK_SUMMARY", JSON.stringify({
-        attempts: browserlessPayload?.attempts,
-        status: browserlessPayload?.status,
-        outcome: browserlessPayload?.clickResult?.outcome,
-        clicked: browserlessPayload?.clickResult?.lastClick?.clicked,
-        finalUrl: browserlessPayload?.finalState?.url
-      }));
-
-      console.log("BOOK_RESULT", JSON.stringify({
-        status: "BROWSERLESS_HTTP_OK",
-        rule,
-        browserless: browserlessPayload,
-      }));
-
-      return res.json({
-        status: "BROWSERLESS_HTTP_OK",
-        browserless: parsed,
-        rule,
-      });
-
+        {
+          maxAttempts: 8,
+          baseDelayMs: 1500,
+          maxDelayMs: 15000,
+          maxTotalMs,
+          logPrefix: "BROWSERLESS",
+        }
+      );
     } catch (err) {
-      const isAbort = err?.name === "AbortError";
-      return res.status(504).json({
-        error: isAbort ? "Browserless HTTP request timed out" : "Browserless HTTP request failed",
+      // Return 503 so Cloud Scheduler retries (configured in job)
+      console.log("BROWSERLESS_FINAL_FAIL", JSON.stringify({ message: String(err?.message || err) }));
+      return res.status(503).json({
+        error: "Browserless unavailable (after retries). Cloud Scheduler should retry.",
         details: String(err?.message || err),
+        rule,
       });
-    } finally {
-      clearTimeout(t);
     }
 
+    const text = await resp.text();
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = { raw: text };
+    }
+
+    if (!resp.ok) {
+      // If Browserless returned non-OK (after retries decided it’s non-retryable), still return 503 to trigger Scheduler retry.
+      console.log("BROWSERLESS_NONOK_FINAL", JSON.stringify({ status: resp.status, bodySnippet: text?.slice(0, 400) || "" }));
+      return res.status(503).json({
+        error: "Browserless Function API non-OK",
+        httpStatus: resp.status,
+        body: parsed,
+        rule,
+      });
+    }
+
+    const browserlessPayload = parsed?.data?.data || parsed?.data || parsed;
+
+    console.log("[BOOK] Browserless response:", JSON.stringify(browserlessPayload).slice(0, 2000));
+    console.log(
+      "BOOK_SUMMARY",
+      JSON.stringify({
+        attempts: browserlessPayload?.attempts,
+        outcome: browserlessPayload?.clickResult?.outcome,
+        clicked: browserlessPayload?.clickResult?.lastClick?.clicked,
+        finalSuccess: browserlessPayload?.finalState?.success,
+        finalUrl: browserlessPayload?.finalState?.url,
+      })
+    );
+
+    // Return 200 so Scheduler marks success *only when Browserless call succeeded*
+    return res.json({
+      status: "BROWSERLESS_HTTP_OK",
+      rule,
+      browserless: browserlessPayload,
+    });
   } finally {
-    RUNNING = false;
-    RUNNING_SINCE = null;
+    isRunning = false;
   }
 });
 
