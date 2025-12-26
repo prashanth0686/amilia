@@ -43,122 +43,138 @@ function isValidCalendarUrl(u) {
   return u.includes("/shop/activities/") || u.includes("/shop/programs/calendar/");
 }
 
-/**
- * A small helper to wait (used by retry logic)
- */
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function parseRetryAfterMs(headers) {
+  const ra = headers?.get?.("retry-after");
+  if (!ra) return null;
+  const sec = Number(ra);
+  if (Number.isFinite(sec)) return sec * 1000;
+  const dt = Date.parse(ra);
+  if (!Number.isNaN(dt)) return Math.max(0, dt - Date.now());
+  return null;
+}
+
 /**
- * Fetch with:
- * - overallBudgetMs (hard deadline)
- * - perAttemptTimeoutMs (AbortController per attempt)
- * - retry on 429, 408, 5xx, network errors
+ * Robust Browserless call with:
+ * - overall timeout (hard cap)
+ * - per-attempt timeout
+ * - retries w/ exponential backoff + jitter
+ * - special handling for 429/5xx/408
  */
-async function fetchWithRetry(url, options, cfg) {
+async function fetchWithRetry(url, fetchOptions, cfg) {
   const {
-    maxAttempts = 3,
-    perAttemptTimeoutMs = 90000,
-    overallBudgetMs = 540000,
-    baseDelayMs = 1500,
-    maxDelayMs = 8000,
+    overallTimeoutMs,
+    perAttemptTimeoutMs,
+    maxAttempts,
+    minBackoffMs,
+    maxBackoffMs,
   } = cfg;
 
-  const start = Date.now();
+  const overallController = new AbortController();
+  const overallTimer = setTimeout(() => overallController.abort(), overallTimeoutMs);
+
+  const started = Date.now();
   let lastErr = null;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const elapsed = Date.now() - start;
-    const remaining = overallBudgetMs - elapsed;
+  try {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const attemptController = new AbortController();
+      const attemptTimer = setTimeout(() => attemptController.abort(), perAttemptTimeoutMs);
 
-    if (remaining <= 0) {
-      throw new Error(
-        `Overall budget exceeded before attempt ${attempt} (elapsed=${elapsed}ms, budget=${overallBudgetMs}ms)`
-      );
-    }
+      const mergedSignal = AbortSignal.any
+        ? AbortSignal.any([overallController.signal, attemptController.signal])
+        : overallController.signal; // fallback
 
-    // Don’t start an attempt if we can’t give it at least a little time
-    const thisAttemptTimeout = Math.min(perAttemptTimeoutMs, remaining);
+      try {
+        const resp = await fetch(url, { ...fetchOptions, signal: mergedSignal });
+        const text = await resp.text();
 
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), thisAttemptTimeout);
+        let parsed;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = { raw: text };
+        }
 
-    try {
-      const resp = await fetch(url, { ...options, signal: controller.signal });
+        if (resp.ok) {
+          return { resp, parsed };
+        }
 
-      // Retry on 429/5xx/408
-      if (
-        resp.status === 429 ||
-        resp.status === 408 ||
-        (resp.status >= 500 && resp.status <= 599)
-      ) {
-        const raw = await resp.text().catch(() => "");
-        lastErr = new Error(`HTTP ${resp.status} from Browserless`);
-        lastErr.details = raw?.slice?.(0, 4000) || raw;
+        // Retry rules
+        const retryableStatus = [408, 429, 500, 502, 503, 504].includes(resp.status);
+        const retryAfterMs = resp.status === 429 ? parseRetryAfterMs(resp.headers) : null;
 
-        // Backoff with jitter
-        const delay = Math.min(
-          maxDelayMs,
-          baseDelayMs * Math.pow(2, attempt - 1)
-        );
-        const jitter = Math.floor(Math.random() * 400);
         console.log(
-          "BROWSERLESS_RETRYABLE_HTTP",
+          "BROWSERLESS_HTTP_NON_OK",
+          JSON.stringify({ attempt, status: resp.status, retryableStatus, retryAfterMs }).slice(0, 2000)
+        );
+
+        if (!retryableStatus || attempt === maxAttempts) {
+          const err = new Error(`Browserless HTTP ${resp.status}`);
+          err.httpStatus = resp.status;
+          err.body = parsed;
+          throw err;
+        }
+
+        // Backoff
+        const base = clamp(minBackoffMs * Math.pow(2, attempt - 1), minBackoffMs, maxBackoffMs);
+        const jitter = Math.floor(Math.random() * 500);
+        const waitMs = retryAfterMs ?? (base + jitter);
+
+        await sleep(waitMs);
+        continue;
+      } catch (err) {
+        lastErr = err;
+
+        const name = err?.name || "";
+        const msg = String(err?.message || err);
+
+        // If overall timed out, stop immediately
+        if (overallController.signal.aborted) {
+          throw new Error(`Overall timeout after ${Date.now() - started}ms`);
+        }
+
+        // AbortError per-attempt is retryable
+        const retryable =
+          name === "AbortError" ||
+          /aborted/i.test(msg) ||
+          /timeout/i.test(msg);
+
+        console.log(
+          "BROWSERLESS_ERR",
           JSON.stringify({
             attempt,
-            status: resp.status,
-            delayMs: delay + jitter,
-            perAttemptTimeoutMs: thisAttemptTimeout,
-          })
+            perAttemptTimeoutMs,
+            retryable,
+            name,
+            message: msg,
+          }).slice(0, 2000)
         );
-        clearTimeout(t);
-        await sleep(delay + jitter);
+
+        if (!retryable || attempt === maxAttempts) {
+          throw err;
+        }
+
+        const base = clamp(minBackoffMs * Math.pow(2, attempt - 1), minBackoffMs, maxBackoffMs);
+        const jitter = Math.floor(Math.random() * 500);
+        await sleep(base + jitter);
         continue;
+      } finally {
+        clearTimeout(attemptTimer);
       }
-
-      clearTimeout(t);
-      return resp;
-    } catch (err) {
-      clearTimeout(t);
-
-      // AbortError due to our per-attempt controller => treat as retryable
-      const name = err?.name || "Error";
-      const message = String(err?.message || err);
-
-      const retryable =
-        name === "AbortError" ||
-        /network|fetch|ECONNRESET|ETIMEDOUT|EAI_AGAIN/i.test(message);
-
-      console.log(
-        "BROWSERLESS_ERR",
-        JSON.stringify({
-          attempt,
-          perAttemptTimeoutMs: thisAttemptTimeout,
-          retryable,
-          name,
-          message,
-        })
-      );
-
-      lastErr = err;
-
-      if (!retryable) break;
-
-      // backoff
-      const delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
-      const jitter = Math.floor(Math.random() * 400);
-      await sleep(delay + jitter);
     }
-  }
 
-  const elapsed = Date.now() - start;
-  const msg = `fetchWithRetry failed after ${cfg.maxAttempts || 3} attempt(s) in ${elapsed}ms: ${String(
-    lastErr?.message || lastErr
-  )}`;
-  const e = new Error(msg);
-  e.cause = lastErr;
-  throw e;
+    throw lastErr || new Error("fetchWithRetry failed");
+  } finally {
+    clearTimeout(overallTimer);
+  }
 }
 
 app.post("/book", async (req, res) => {
@@ -253,6 +269,10 @@ app.post("/book", async (req, res) => {
     return res.status(400).json({
       error: "Invalid activityUrl (must include /shop/activities/ OR /shop/programs/calendar/)",
       provided: rule.activityUrl,
+      examplePrograms:
+        "https://app.amilia.com/store/en/ville-de-quebec1/shop/programs/calendar/126867?view=basicWeek&scrollToCalendar=true&date=2025-12-27",
+      exampleActivities:
+        "https://app.amilia.com/store/en/ville-de-quebec1/shop/activities/6112282?scrollToCalendar=true&view=month",
       rule,
     });
   }
@@ -261,7 +281,7 @@ app.post("/book", async (req, res) => {
     BROWSERLESS_TOKEN
   )}`;
 
-  // Browserless Function (Puppeteer runtime)
+  // Browserless Function code
   const code = `
 export default async function ({ page, context }) {
   const {
@@ -284,10 +304,12 @@ export default async function ({ page, context }) {
     return Number(m[1]) * 60 + Number(m[2]);
   };
 
+  const normalizeText = (s) => String(s || "").replace(/\\s+/g, " ").trim();
+
   const windowStartMin = hhmmToMinutes(EVENING_START);
   const windowEndMin = hhmmToMinutes(EVENING_END);
 
-  // -------- 1) Login --------
+  // 1) Login
   await page.goto("https://app.amilia.com/en/login", {
     waitUntil: "domcontentloaded",
     timeout: 60000
@@ -306,23 +328,22 @@ export default async function ({ page, context }) {
 
   const submitSel = 'button[type="submit"], input[type="submit"]';
   const submit = await page.$(submitSel);
-  if (submit) {
-    await submit.click();
-  } else {
+  if (submit) await submit.click();
+  else {
     await page.focus(passSel);
     await page.keyboard.press("Enter");
   }
 
   await page.waitForFunction(() => !location.href.includes("/login"), { timeout: 60000 }).catch(() => {});
 
-  // -------- 2) Go to calendar --------
+  // 2) Go to calendar
   await page.goto(ACTIVITY_URL, { waitUntil: "networkidle2", timeout: 60000 });
   await sleep(1200);
 
   const maxAttempts = Math.max(1, Math.floor((Number(POLL_SECONDS) * 1000) / Number(POLL_INTERVAL_MS)));
   let attempts = 0;
 
-  // STRICT success detection (avoid false positives)
+  // Strict success detection
   const getState = async () => {
     return await page.evaluate(() => {
       const normalize = (s) => String(s || "").replace(/\\s+/g, " ").trim();
@@ -330,6 +351,7 @@ export default async function ({ page, context }) {
       const url = location.href;
 
       const hasQuickReg = /[?&]quickRegisterId=\\d+/.test(url);
+
       const hasCartCue =
         /\\/cart\\b/i.test(url) ||
         /\\/checkout\\b/i.test(url) ||
@@ -340,7 +362,12 @@ export default async function ({ page, context }) {
       const cannotRegister = /cannot register/i.test(bodyText);
       const notOpenedYet = /registration has not yet been opened/i.test(bodyText);
 
-      return { url, success: Boolean(hasQuickReg || hasCartCue), cannotRegister, notOpenedYet };
+      return {
+        url,
+        success: Boolean(hasQuickReg || hasCartCue),
+        cannotRegister,
+        notOpenedYet
+      };
     });
   };
 
@@ -382,6 +409,7 @@ export default async function ({ page, context }) {
         const btn = container.querySelector("button.register, a.register, button[title='Register'], a[title='Register']");
         if (!btn) continue;
         if (!isVisible(btn)) continue;
+
         const text = normalize(container.innerText || "");
         candidates.push({ text, btn });
       }
@@ -428,9 +456,19 @@ export default async function ({ page, context }) {
   let lastState = await getState();
 
   if (lastState.success) {
-    return { data: { status: "POLLING_DONE", url: lastState.url, attempts: 0, finalState: lastState, clickResult: { outcome: "SUCCESS_ALREADY", attempts: 0, state: lastState } }, type: "application/json" };
+    return {
+      data: {
+        status: "POLLING_DONE",
+        url: lastState.url,
+        attempts: 0,
+        finalState: lastState,
+        clickResult: { outcome: "SUCCESS_ALREADY", attempts: 0, state: lastState }
+      },
+      type: "application/json"
+    };
   }
 
+  // 3) Poll loop
   while (attempts < maxAttempts) {
     attempts += 1;
 
@@ -467,22 +505,26 @@ export default async function ({ page, context }) {
     (attempts >= maxAttempts ? "TIMEOUT" : "STOPPED");
 
   return {
-    data: { status: "POLLING_DONE", url: finalState.url, attempts, finalState, clickResult: lastClick ? { outcome, attempts, lastClick, state: finalState } : { outcome, attempts, state: finalState } },
+    data: {
+      status: "POLLING_DONE",
+      url: finalState.url,
+      attempts,
+      finalState,
+      clickResult: lastClick ? { outcome, attempts, lastClick, state: finalState } : { outcome, attempts, state: finalState }
+    },
     type: "application/json"
   };
 }
 `.trim();
 
-  // ====== FINAL TIMEOUTS (must match Scheduler+Cloud Run) ======
-  // Cloud Run timeout should be 600s
-  // Scheduler attempt deadline should be 600s
-  // Our own overall budget should be slightly less: 540s
-  const overallBudgetMs = Number(process.env.BROWSERLESS_OVERALL_TIMEOUT_MS || "540000");
-  const perAttemptTimeoutMs = Number(process.env.BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS || "90000");
+  const overallTimeoutMs = Number(process.env.BROWSERLESS_OVERALL_TIMEOUT_MS || "540000"); // 9m
+  const perAttemptTimeoutMs = Number(process.env.BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS || "120000"); // 2m
   const maxAttempts = Number(process.env.BROWSERLESS_MAX_ATTEMPTS || "3");
+  const minBackoffMs = Number(process.env.BROWSERLESS_MIN_BACKOFF_MS || "5000");
+  const maxBackoffMs = Number(process.env.BROWSERLESS_MAX_BACKOFF_MS || "30000");
 
   try {
-    const resp = await fetchWithRetry(
+    const { resp, parsed } = await fetchWithRetry(
       functionUrl,
       {
         method: "POST",
@@ -501,32 +543,8 @@ export default async function ({ page, context }) {
           },
         }),
       },
-      {
-        maxAttempts,
-        perAttemptTimeoutMs,
-        overallBudgetMs,
-        baseDelayMs: 1500,
-        maxDelayMs: 8000,
-      }
+      { overallTimeoutMs, perAttemptTimeoutMs, maxAttempts, minBackoffMs, maxBackoffMs }
     );
-
-    const text = await resp.text();
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      parsed = { raw: text };
-    }
-
-    if (!resp.ok) {
-      console.log("BROWSERLESS_ERROR_BODY", JSON.stringify(parsed).slice(0, 4000));
-      return res.status(502).json({
-        error: "Browserless Function API error",
-        httpStatus: resp.status,
-        body: parsed,
-        rule,
-      });
-    }
 
     const payload = parsed?.data?.data || parsed?.data || parsed;
 
@@ -539,31 +557,29 @@ export default async function ({ page, context }) {
         clicked: payload?.clickResult?.lastClick?.clicked,
         finalSuccess: payload?.finalState?.success,
         finalUrl: payload?.finalState?.url,
-        overallBudgetMs,
-        perAttemptTimeoutMs,
-        maxAttempts,
       })
     );
 
     return res.json({
       status: "BROWSERLESS_HTTP_OK",
-      browserless: parsed,
+      httpStatus: resp.status,
+      browserless: payload,
       rule,
     });
   } catch (err) {
-    console.log(
-      "BROWSERLESS_FINAL_FAIL",
-      JSON.stringify({ message: String(err?.message || err) }).slice(0, 2000)
-    );
-
     const msg = String(err?.message || err);
-    const isTimeout = /budget exceeded|aborted|AbortError|timed out/i.test(msg);
+    console.log("BROWSERLESS_FINAL_FAIL", JSON.stringify({ message: msg }).slice(0, 2000));
 
-    return res.status(isTimeout ? 504 : 502).json({
-      error: isTimeout ? "Browserless timed out / exceeded budget" : "Browserless request failed",
+    // Return quickly with a clear failure (so Scheduler doesn't timeout)
+    return res.status(503).json({
+      error: "Browserless call failed",
       details: msg,
       rule,
-      timeouts: { overallBudgetMs, perAttemptTimeoutMs, maxAttempts },
+      tips: [
+        "If you see 429, reduce parallel runs (Cloud Run concurrency=1, max instances=1, only one Scheduler job enabled).",
+        "Ensure Scheduler attempt deadline >= Cloud Run timeout.",
+        "Increase per-attempt timeout if Browserless is slow.",
+      ],
     });
   }
 });
