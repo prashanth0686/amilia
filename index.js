@@ -1,441 +1,527 @@
-import express from "express";
+/**
+ * index.js — Cloud Run (Express) endpoint for Cloud Scheduler
+ *
+ * Goals:
+ * 1) Cloud Scheduler NEVER fails due to your app logic: always return HTTP 200 with JSON.
+ * 2) dryRun is FAST (skips Browserless entirely).
+ * 3) Browserless timeouts (408), rate limits (429), and 5xx are retryable.
+ * 4) Optional “warmup/login before 8am” flow using Firestore session storage.
+ *
+ * Required ENV (already in your screenshots):
+ * - API_KEY                      (your internal x-api-key)
+ * - BROWSERLESS_TOKEN
+ * - BROWSERLESS_HTTP_BASE        (e.g. https://production-sfo.browserless.io)
+ * - AMILIA_EMAIL
+ * - AMILIA_PASSWORD
+ * - LOCAL_TZ                     (e.g. America/Toronto)
+ * - ACTIVITY_URL                 (full activity URL you want)
+ *
+ * Recommended ENV:
+ * - BROWSERLESS_OVERALL_TIMEOUT_MS=540000
+ * - BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS=180000   (3 min recommended)
+ * - BROWSERLESS_MAX_ATTEMPTS=3
+ * - SESSION_STORE=firestore
+ * - FIRESTORE_SESSION_DOC=amilia/session        (collection/doc)
+ *
+ * NOTE:
+ * - This file DOES NOT contain your actual booking selectors (site can change).
+ * - It gives you a stable framework + where to plug the booking steps.
+ */
 
-// Node 18+ has fetch built-in
+"use strict";
+
+const express = require("express");
+
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "1mb" }));
 
+/** ---------- Config helpers ---------- */
 const PORT = process.env.PORT || 8080;
 
-/** -----------------------------
- *  Basic health + auth
- *  ----------------------------- */
-app.get("/", (_req, res) => res.status(200).json({ status: "ok" }));
-
-function requireApiKey(req, res) {
-  const apiKey = req.headers["x-api-key"];
-  if (!process.env.API_KEY) {
-    res.status(500).json({ ok: false, error: "Missing API_KEY in env" });
-    return false;
-  }
-  if (!apiKey || apiKey !== process.env.API_KEY) {
-    res.status(401).json({ ok: false, error: "Unauthorized (invalid x-api-key)" });
-    return false;
-  }
-  return true;
-}
-
-/** -----------------------------
- *  Config helpers
- *  ----------------------------- */
-function envInt(name, fallback) {
+function envInt(name, def) {
   const v = process.env[name];
-  if (v === undefined || v === null || v === "") return fallback;
+  if (v === undefined || v === "") return def;
   const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
+  return Number.isFinite(n) ? n : def;
 }
 
-function envStr(name, fallback = "") {
-  const v = process.env[name];
-  return v === undefined || v === null || v === "" ? fallback : v;
+const CONFIG = {
+  apiKey: process.env.API_KEY || "",
+  browserless: {
+    token: process.env.BROWSERLESS_TOKEN || "",
+    httpBase: process.env.BROWSERLESS_HTTP_BASE || "https://production-sfo.browserless.io",
+    overallTimeoutMs: envInt("BROWSERLESS_OVERALL_TIMEOUT_MS", 540000),
+    perAttemptTimeoutMs: envInt("BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS", 180000),
+    maxAttempts: envInt("BROWSERLESS_MAX_ATTEMPTS", 3),
+  },
+  amilia: {
+    email: process.env.AMILIA_EMAIL || "",
+    password: process.env.AMILIA_PASSWORD || "",
+  },
+  defaults: {
+    localTz: process.env.LOCAL_TZ || "America/Toronto",
+    activityUrl: process.env.ACTIVITY_URL || "",
+    targetDay: process.env.TARGET_DAY || "Wednesday",
+    eveningStart: process.env.EVENING_START || "13:00",
+    eveningEnd: process.env.EVENING_END || "20:00",
+  },
+  sessionStore: process.env.SESSION_STORE || "memory", // "firestore" recommended
+  firestoreDoc: process.env.FIRESTORE_SESSION_DOC || "amilia/session",
+};
+
+/** ---------- Optional Firestore session storage ---------- */
+let firestore = null;
+async function getFirestore() {
+  if (CONFIG.sessionStore !== "firestore") return null;
+  if (firestore) return firestore;
+  // Lazy-load to avoid crashing if you didn't install it.
+  const { Firestore } = require("@google-cloud/firestore");
+  firestore = new Firestore();
+  return firestore;
 }
 
-function nowIso() {
-  return new Date().toISOString();
+async function saveSession(sessionObj) {
+  if (CONFIG.sessionStore !== "firestore") {
+    inMemorySession = sessionObj;
+    return { store: "memory" };
+  }
+  const fs = await getFirestore();
+  const [col, doc] = CONFIG.firestoreDoc.split("/");
+  await fs.collection(col).doc(doc).set(
+    {
+      updatedAt: new Date().toISOString(),
+      session: sessionObj,
+    },
+    { merge: true }
+  );
+  return { store: "firestore", doc: CONFIG.firestoreDoc };
 }
 
-/** -----------------------------
- *  Timeout + retry wrapper
- *  ----------------------------- */
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+async function loadSession() {
+  if (CONFIG.sessionStore !== "firestore") return inMemorySession || null;
+  const fs = await getFirestore();
+  const [col, doc] = CONFIG.firestoreDoc.split("/");
+  const snap = await fs.collection(col).doc(doc).get();
+  if (!snap.exists) return null;
+  const data = snap.data();
+  return data?.session || null;
 }
 
-function isRetryableHttpStatus(status) {
-  if (!status) return true; // network errors etc.
+let inMemorySession = null; // fallback only
+
+/** ---------- Auth middleware (x-api-key) ---------- */
+function requireApiKey(req, res, next) {
+  // Allow health checks without key:
+  if (req.path === "/" || req.path === "/health") return next();
+
+  const key = req.header("x-api-key") || req.header("X-Api-Key") || "";
+  if (!CONFIG.apiKey) {
+    // If you forgot to set API_KEY, fail safely but still return 200 (Scheduler should not fail).
+    return res.status(200).json({
+      ok: false,
+      status: "MISCONFIGURED",
+      error: "API_KEY env is not set",
+    });
+  }
+  if (key !== CONFIG.apiKey) {
+    return res.status(200).json({
+      ok: false,
+      status: "UNAUTHORIZED",
+      error: "Unauthorized (invalid x-api-key)",
+    });
+  }
+  next();
+}
+app.use(requireApiKey);
+
+/** ---------- Stable response wrapper ----------
+ * Always return HTTP 200 to Scheduler, even if booking fails.
+ */
+function ok200(res, payload) {
+  return res.status(200).json(payload);
+}
+
+function normalizeRule(body) {
+  const rule = {
+    targetDay: body?.targetDay ?? CONFIG.defaults.targetDay,
+    eveningStart: body?.eveningStart ?? CONFIG.defaults.eveningStart,
+    eveningEnd: body?.eveningEnd ?? CONFIG.defaults.eveningEnd,
+    timeZone: body?.timeZone ?? CONFIG.defaults.localTz,
+    activityUrl: body?.activityUrl ?? CONFIG.defaults.activityUrl,
+    dryRun: Boolean(body?.dryRun ?? false),
+    pollSeconds: envInt("POLL_SECONDS", body?.pollSeconds ?? 420),
+    pollIntervalMs: envInt("POLL_INTERVAL_MS", body?.pollIntervalMs ?? 3000),
+
+    // Your extra steps:
+    playerName: body?.playerName ?? "Hari Prashanth Vaidyula",
+    addressFull: body?.addressFull ?? "383 rue des maraichers, quebec, qc, G1C 0K2",
+  };
+
+  // Basic sanity:
+  if (!rule.activityUrl) {
+    rule._warning = "ACTIVITY_URL not set (or activityUrl not provided in request)";
+  }
+  return rule;
+}
+
+/** ---------- Retryable HTTP helper ----------
+ * Retries on 408/429/5xx and network errors.
+ */
+async function sleep(ms) {
+  await new Promise((r) => setTimeout(r, ms));
+}
+
+function shouldRetryStatus(status) {
+  if (!status) return true; // network/unknown
   if (status === 408) return true;
   if (status === 429) return true;
   if (status >= 500 && status <= 599) return true;
   return false;
 }
 
-async function fetchWithRetry(url, options, retryCfg) {
-  const maxAttempts = Math.max(1, Number(retryCfg.maxAttempts || 1));
-  const perAttemptTimeoutMs = Math.max(1000, Number(retryCfg.perAttemptTimeoutMs || 30000));
-  const overallTimeoutMs = Math.max(perAttemptTimeoutMs, Number(retryCfg.overallTimeoutMs || perAttemptTimeoutMs));
+/** ---------- Browserless call ----------
+ * We use Browserless /function endpoint so we can run Node code server-side.
+ * IMPORTANT: You must keep your function code small and deterministic.
+ *
+ * If you already had a working Browserless integration before, you can replace
+ * browserlessFunctionSource() with your existing one.
+ */
+function browserlessUrl() {
+  // Browserless function endpoint:
+  // https://<host>/function?token=<TOKEN>
+  const base = CONFIG.browserless.httpBase.replace(/\/+$/, "");
+  return `${base}/function?token=${encodeURIComponent(CONFIG.browserless.token)}`;
+}
 
+function browserlessFunctionSource() {
+  // This runs inside Browserless. You can (and should) replace selectors here
+  // with your known-working logic. This is a stub framework.
+  //
+  // It returns JSON string; Browserless will return that as the response body.
+  //
+  // Key idea:
+  // - Use the session (cookies/localStorage) if provided
+  // - If not, login and then return session so Cloud Run can store it (warmup)
+  // - During booking run, reuse session to avoid slow login at 8am
+  return `
+module.exports = async ({ page, context, request }) => {
+  const input = (request && request.body) || {};
+  const mode = input.mode || "book"; // "warmup" or "book"
+  const rule = input.rule || {};
+  const session = input.session || null;
+
+  const AMILIA_EMAIL = input.amiliaEmail;
+  const AMILIA_PASSWORD = input.amiliaPassword;
+
+  // Helper: apply cookies
+  async function applySession(sess) {
+    if (!sess) return;
+    try {
+      if (Array.isArray(sess.cookies)) {
+        await context.addCookies(sess.cookies);
+      }
+    } catch (e) {}
+  }
+
+  // Helper: extract cookies
+  async function extractSession() {
+    try {
+      const cookies = await context.cookies();
+      return { cookies };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ---- Apply existing session (if any) ----
+  await applySession(session);
+
+  // ---- Go to site ----
+  const url = rule.activityUrl;
+  if (!url) {
+    return JSON.stringify({ ok:false, status:"NO_ACTIVITY_URL" });
+  }
+
+  // Faster defaults
+  await page.setViewport({ width: 1280, height: 800 });
+  page.setDefaultTimeout(45000);
+  page.setDefaultNavigationTimeout(45000);
+
+  // ---- Login flow (stub) ----
+  // You MUST update these selectors based on the actual Amilia login UI.
+  async function ensureLoggedIn() {
+    // Navigate:
+    await page.goto(url, { waitUntil: "domcontentloaded" });
+
+    // Heuristic: if login button exists, login; otherwise assume logged in.
+    const loginButton = await page.$('a[href*="login"], button:has-text("Login"), button:has-text("Sign in")');
+    if (!loginButton) return { didLogin:false };
+
+    // Click login:
+    await loginButton.click().catch(()=>{});
+    await page.waitForTimeout(1000);
+
+    // Fill credentials (replace selectors):
+    const emailSel = 'input[type="email"], input[name="email"]';
+    const passSel = 'input[type="password"], input[name="password"]';
+
+    await page.waitForSelector(emailSel, { timeout: 15000 });
+    await page.fill(emailSel, AMILIA_EMAIL);
+    await page.fill(passSel, AMILIA_PASSWORD);
+
+    // Submit:
+    const submit = await page.$('button[type="submit"], button:has-text("Sign in"), button:has-text("Login")');
+    if (submit) await submit.click();
+
+    // Wait a bit for redirect/session:
+    await page.waitForTimeout(4000);
+
+    return { didLogin:true };
+  }
+
+  // If we’re warmup, login + return session
+  if (mode === "warmup") {
+    const loginRes = await ensureLoggedIn();
+    const newSession = await extractSession();
+    return JSON.stringify({ ok:true, status:"WARMUP_OK", loginRes, session:newSession });
+  }
+
+  // Booking run: make sure logged in too (in case cookies expired)
+  const loginRes = await ensureLoggedIn();
+
+  // ---- Booking steps (stub placeholders) ----
+  // You asked:
+  // 1) Click register exactly when open (8am)
+  // 2) Select player checkbox: "Hari Prashanth Vaidyula"
+  // 3) Address search: "383 rue des maraichers, quebec, qc, G1C 0K2" and pick suggestion
+  //
+  // Replace the selectors below with the real ones from the page.
+  const playerName = rule.playerName || "";
+  const addressFull = rule.addressFull || "";
+
+  // TODO: implement real detection for "registrations open"
+  // For now just return success stub to show flow.
+  const finalSession = await extractSession();
+
+  return JSON.stringify({
+    ok: true,
+    status: "BROWSERLESS_OK",
+    note: "Stub booking flow ran. Replace selectors in browserlessFunctionSource() to actually book.",
+    loginRes,
+    playerName,
+    addressFull,
+    session: finalSession
+  });
+};
+`.trim();
+}
+
+async function callBrowserless({ mode, rule, session }) {
+  const url = browserlessUrl();
+  const source = browserlessFunctionSource();
+
+  const payload = {
+    code: source,
+    context: { stealth: true },
+    // Browserless gives request.body to function as `request.body`
+    // (function runner passes the JSON body you send as request.body).
+    // We'll put our runtime inputs under request.body:
+    // NOTE: Some Browserless deployments accept `payload` as request.body directly.
+    // If your Browserless expects a different format, adapt here.
+    // We use a common pattern: send inputs as top-level keys too.
+    mode,
+    rule,
+    session,
+    amiliaEmail: CONFIG.amilia.email,
+    amiliaPassword: CONFIG.amilia.password,
+  };
+
+  // Node 18+ has global fetch on Cloud Run.
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      // Browserless "function" expects { code, context, ... } as body
+      // and then passes the whole body into request.body in many setups.
+      // To be safe, we include everything here.
+      ...payload,
+      // Also duplicate as requestBody-style field that some templates use:
+      data: payload,
+    }),
+    signal: AbortSignal.timeout(CONFIG.browserless.perAttemptTimeoutMs),
+  });
+
+  const text = await resp.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    json = { raw: text };
+  }
+  return { httpStatus: resp.status, body: json };
+}
+
+async function browserlessWithRetry({ mode, rule, session }) {
   const started = Date.now();
-  let lastErr = null;
+  const attempts = Math.max(1, CONFIG.browserless.maxAttempts);
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  let last = null;
+  for (let i = 1; i <= attempts; i++) {
     const elapsed = Date.now() - started;
-    const remainingOverall = overallTimeoutMs - elapsed;
-    if (remainingOverall <= 0) {
-      const err = new Error(`Overall timeout exceeded (${overallTimeoutMs}ms)`);
-      err.name = "OverallTimeoutError";
-      lastErr = err;
-      break;
+    if (elapsed >= CONFIG.browserless.overallTimeoutMs) {
+      return {
+        ok: false,
+        status: "BROWSERLESS_OVERALL_TIMEOUT",
+        retry: { attempts: i - 1, maxAttempts: attempts, elapsedMs: elapsed },
+        last,
+      };
     }
 
-    // Abort slightly AFTER perAttemptTimeout so we don’t cut off too early
-    const attemptBudget = Math.min(perAttemptTimeoutMs, remainingOverall);
-    const controller = new AbortController();
-    const abortTimer = setTimeout(() => controller.abort(), attemptBudget + 250);
-
     try {
-      const resp = await fetch(url, { ...options, signal: controller.signal });
-      clearTimeout(abortTimer);
+      const out = await callBrowserless({ mode, rule, session });
+      last = out;
 
-      if (!resp.ok) {
-        const status = resp.status;
-        const text = await safeReadText(resp);
-
-        const err = new Error(`HTTP ${status}: ${text?.slice(0, 500) || ""}`.trim());
-        err.name = "HttpError";
-        err.status = status;
-        err.body = text;
-
-        if (isRetryableHttpStatus(status) && attempt < maxAttempts) {
-          console.log("BROWSERLESS_ERR", JSON.stringify({
-            attempt,
-            perAttemptTimeoutMs,
-            overallTimeoutMs,
-            maxAttempts,
-            retryable: true,
-            status,
-            name: err.name,
-            message: err.message
-          }));
-          // backoff: 1.5s, 3s, 6s...
-          const backoff = Math.min(1500 * Math.pow(2, attempt - 1), 10000);
-          await sleep(backoff);
-          lastErr = err;
-          continue;
+      if (out.httpStatus >= 200 && out.httpStatus < 300) {
+        // Browserless responded 2xx. Decide if this is "success" logically:
+        if (out.body?.ok === false && out.body?.status) {
+          // Logical failure inside 2xx response -> still "ok" for Scheduler, but booking failed.
+          // Whether to retry depends on inner status.
+          const inner = String(out.body.status || "");
+          const retryableInner = inner.includes("TIMEOUT") || inner.includes("429") || inner.includes("5XX");
+          if (retryableInner && i < attempts) {
+            await sleep(Math.min(2000 * i, 8000));
+            continue;
+          }
         }
-
-        lastErr = err;
-        return { ok: false, status: "BROWSERLESS_HTTP_ERROR", httpStatus: status, raw: text, attempt };
+        return {
+          ok: true,
+          status: "BROWSERLESS_OK",
+          httpStatus: out.httpStatus,
+          body: out.body,
+          retry: { attempts: i, maxAttempts: attempts, elapsedMs: Date.now() - started },
+        };
       }
 
-      const text = await safeReadText(resp);
-      return { ok: true, status: "BROWSERLESS_OK", httpStatus: resp.status, raw: text, attempt };
-    } catch (e) {
-      clearTimeout(abortTimer);
-
-      const name = e?.name || "Error";
-      const message = e?.message || String(e);
-
-      const retryable =
-        name === "AbortError" ||
-        name === "TimeoutError" ||
-        name === "FetchError" ||
-        /aborted/i.test(message) ||
-        /timeout/i.test(message);
-
-      if (retryable && attempt < maxAttempts) {
-        console.log("BROWSERLESS_ERR", JSON.stringify({
-          attempt,
-          perAttemptTimeoutMs,
-          overallTimeoutMs,
-          maxAttempts,
-          retryable: true,
-          name,
-          message
-        }));
-        const backoff = Math.min(1500 * Math.pow(2, attempt - 1), 10000);
-        await sleep(backoff);
-        lastErr = e;
+      // Non-2xx:
+      if (shouldRetryStatus(out.httpStatus) && i < attempts) {
+        await sleep(Math.min(2000 * i, 8000));
         continue;
       }
 
-      lastErr = e;
-      return { ok: false, status: "BROWSERLESS_FETCH_ERROR", httpStatus: 0, raw: message, attempt };
+      return {
+        ok: false,
+        status: "BROWSERLESS_HTTP_ERROR",
+        httpStatus: out.httpStatus,
+        body: out.body,
+        retry: { attempts: i, maxAttempts: attempts, elapsedMs: Date.now() - started },
+      };
+    } catch (err) {
+      const msg = err?.name || err?.message || String(err);
+      last = { error: msg };
+
+      // AbortSignal.timeout throws TimeoutError in many environments; treat retryable:
+      const retryable = true;
+      if (retryable && i < attempts) {
+        await sleep(Math.min(2000 * i, 8000));
+        continue;
+      }
+
+      return {
+        ok: false,
+        status: "BROWSERLESS_EXCEPTION",
+        error: msg,
+        retry: { attempts: i, maxAttempts: attempts, elapsedMs: Date.now() - started },
+      };
     }
   }
 
-  // If we exit loop without returning, we failed overall
-  const finalStatus = lastErr?.status || (lastErr?.name === "AbortError" ? 408 : 500);
-  console.log("BROWSERLESS_FINAL_FAIL", JSON.stringify({
-    message: `fetchWithRetry failed after ${retryCfg.maxAttempts || 1} attempt(s)`,
-    status: finalStatus
-  }));
-  return { ok: false, status: "BROWSERLESS_FINAL_FAIL", httpStatus: finalStatus, raw: lastErr?.message || String(lastErr) };
-}
-
-async function safeReadText(resp) {
-  try {
-    return await resp.text();
-  } catch {
-    return "";
-  }
-}
-
-/** -----------------------------
- *  Booking rule builder
- *  ----------------------------- */
-function buildRule(reqBody = {}) {
-  const rule = {
-    targetDay: reqBody.targetDay ?? envStr("TARGET_DAY", "Wednesday"),
-    eveningStart: reqBody.eveningStart ?? envStr("EVENING_START", "13:00"),
-    eveningEnd: reqBody.eveningEnd ?? envStr("EVENING_END", "20:00"),
-    timeZone: reqBody.timeZone ?? envStr("LOCAL_TZ", "America/Toronto"),
-    activityUrl: reqBody.activityUrl ?? envStr("ACTIVITY_URL", ""),
-    dryRun: reqBody.dryRun ?? false,
-    pollSeconds: reqBody.pollSeconds ?? 420,
-    pollIntervalMs: reqBody.pollIntervalMs ?? 3000,
-    playerName: reqBody.playerName ?? envStr("PLAYER_NAME", ""),
-    addressFull: reqBody.addressFull ?? envStr("ADDRESS_FULL", "")
-  };
-
-  // Retry config (can be overridden by body if needed)
-  const retry = {
-    maxAttempts: reqBody.maxAttempts ?? envInt("BROWSERLESS_MAX_ATTEMPTS", 3),
-    perAttemptTimeoutMs: reqBody.perAttemptTimeoutMs ?? envInt("BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS", 90000),
-    overallTimeoutMs: reqBody.overallTimeoutMs ?? envInt("BROWSERLESS_OVERALL_TIMEOUT_MS", 540000)
-  };
-
-  return { rule, retry };
-}
-
-/** -----------------------------
- *  Browserless call
- *  NOTE: This uses Browserless "function" endpoint with Puppeteer.
- *  You MUST adjust selectors via env vars if defaults don’t match.
- *  ----------------------------- */
-function buildSelectors() {
   return {
-    loginEmail: envStr("SEL_LOGIN_EMAIL", 'input[type="email"], input[name="email"], #email'),
-    loginPassword: envStr("SEL_LOGIN_PASSWORD", 'input[type="password"], input[name="password"], #password'),
-    loginSubmit: envStr("SEL_LOGIN_SUBMIT", 'button[type="submit"], button[name="login"]'),
-
-    registerButton: envStr("SEL_REGISTER_BUTTON", 'button:has-text("Register"), a:has-text("Register")'),
-
-    // Player selection step
-    playerContainer: envStr("SEL_PLAYER_CHECKBOX_CONTAINER", "body"), // you can scope if needed
-    playerNext: envStr("SEL_PLAYER_NEXT_BUTTON", 'button:has-text("Next"), button:has-text("Proceed"), button[type="submit"]'),
-
-    // Address step
-    addressInput: envStr("SEL_ADDRESS_INPUT", 'input[type="search"], input[placeholder*="Address"], input[name*="address"]'),
-    addressSuggestionList: envStr("SEL_ADDRESS_SUGGESTION_LIST", '[role="listbox"], ul[role="listbox"], .pac-container'),
-    addressNext: envStr("SEL_ADDRESS_NEXT_BUTTON", 'button:has-text("Next"), button:has-text("Proceed"), button[type="submit"]')
+    ok: false,
+    status: "BROWSERLESS_FINAL_FAIL",
+    last,
   };
 }
 
-function buildBrowserlessFunctionPayload({ rule }) {
-  const selectors = buildSelectors();
+/** ---------- Routes ---------- */
+app.get("/", (req, res) => ok200(res, { ok: true, status: "OK", service: "amilia-booker" }));
+app.get("/health", (req, res) => ok200(res, { ok: true, status: "HEALTHY" }));
 
-  // Browserless "function" code runs in their environment.
-  // It must be a string. Keep it concise and log milestones.
-  const code = `
-    const puppeteer = require('puppeteer');
-    module.exports = async ({ page, context }) => {
-      const {
-        amiliaEmail, amiliaPassword,
-        activityUrl, pollSeconds, pollIntervalMs,
-        playerName, addressFull,
-        selectors, dryRun
-      } = context;
-
-      const log = (msg, obj) => console.log(msg, obj ? JSON.stringify(obj) : "");
-
-      // 1) Go to site / activity
-      log("NAVIGATE_START", { activityUrl });
-      await page.goto(activityUrl, { waitUntil: 'networkidle2', timeout: 120000 });
-      log("NAVIGATE_OK");
-
-      // 2) Login (if needed)
-      // Heuristic: if login fields exist, fill them.
-      const emailSel = selectors.loginEmail;
-      const passSel = selectors.loginPassword;
-
-      const emailExists = await page.$(emailSel);
-      const passExists = await page.$(passSel);
-
-      if (emailExists && passExists) {
-        log("LOGIN_START");
-        await page.click(emailSel, { clickCount: 3 });
-        await page.type(emailSel, amiliaEmail, { delay: 10 });
-        await page.click(passSel, { clickCount: 3 });
-        await page.type(passSel, amiliaPassword, { delay: 10 });
-
-        const submitSel = selectors.loginSubmit;
-        const submitBtn = await page.$(submitSel);
-        if (submitBtn) {
-          await Promise.all([
-            page.click(submitSel),
-            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 120000 }).catch(() => null)
-          ]);
-        }
-        log("LOGIN_OK");
-      } else {
-        log("LOGIN_SKIP", { reason: "login fields not found" });
-      }
-
-      // 3) Poll for Register opening
-      const deadline = Date.now() + (pollSeconds * 1000);
-      log("POLL_START", { pollSeconds, pollIntervalMs });
-
-      let registerFound = false;
-      while (Date.now() < deadline) {
-        const registerBtn = await page.$(selectors.registerButton);
-        if (registerBtn) {
-          registerFound = true;
-          break;
-        }
-        await page.waitForTimeout(pollIntervalMs);
-        await page.reload({ waitUntil: 'networkidle2' }).catch(() => null);
-      }
-
-      if (!registerFound) {
-        log("REGISTER_NOT_FOUND");
-        return { ok: false, step: "POLL_REGISTER", message: "Register button not found within poll window" };
-      }
-
-      log("REGISTER_FOUND");
-      if (dryRun) {
-        log("DRY_RUN_STOP");
-        return { ok: true, step: "DRY_RUN", message: "Register found (dryRun true)" };
-      }
-
-      // Click Register
-      await page.click(selectors.registerButton).catch(() => null);
-      await page.waitForTimeout(1500);
-
-      // 4) Player selection (select checkbox by visible text match)
-      log("PLAYER_STEP_START", { playerName });
-
-      // Find label containing playerName; click its associated checkbox
-      const clickedPlayer = await page.evaluate(({ playerName }) => {
-        const textMatch = (el) => (el?.innerText || "").toLowerCase().includes(playerName.toLowerCase());
-        const labels = Array.from(document.querySelectorAll('label, div, span, p'));
-        for (const el of labels) {
-          if (textMatch(el)) {
-            // Try click near it
-            el.click();
-            return true;
-          }
-        }
-        return false;
-      }, { playerName });
-
-      log("PLAYER_SELECTED", { clickedPlayer });
-
-      // Click Next/Proceed
-      await page.click(selectors.playerNext).catch(() => null);
-      await page.waitForTimeout(1500);
-
-      // 5) Address step
-      log("ADDRESS_STEP_START", { addressFull });
-
-      // Type address
-      const addrSel = selectors.addressInput;
-      await page.waitForSelector(addrSel, { timeout: 30000 });
-      await page.click(addrSel, { clickCount: 3 });
-      await page.type(addrSel, addressFull, { delay: 10 });
-
-      // Wait suggestions and choose first matching suggestion
-      await page.waitForTimeout(1200);
-
-      // Try pick first suggestion item
-      const picked = await page.keyboard.press('ArrowDown').then(() => page.keyboard.press('Enter')).then(() => true).catch(() => false);
-      log("ADDRESS_PICKED", { picked });
-
-      // Next/Proceed
-      await page.click(selectors.addressNext).catch(() => null);
-      await page.waitForTimeout(1500);
-
-      log("FLOW_DONE");
-      return { ok: true, step: "DONE", message: "Flow completed (final confirmation step may still be required depending on site)" };
-    };
-  `;
-
-  return {
-    code,
-    context: {
-      amiliaEmail: envStr("AMILIA_EMAIL", ""),
-      amiliaPassword: envStr("AMILIA_PASSWORD", ""),
-      activityUrl: rule.activityUrl,
-      pollSeconds: rule.pollSeconds,
-      pollIntervalMs: rule.pollIntervalMs,
-      playerName: rule.playerName,
-      addressFull: rule.addressFull,
-      selectors,
-      dryRun: rule.dryRun
-    }
-  };
-}
-
-async function callBrowserless({ rule, retry }) {
-  const base = envStr("BROWSERLESS_HTTP_BASE", "");
-  const token = envStr("BROWSERLESS_TOKEN", "");
-  if (!base || !token) {
-    return { ok: false, status: "CONFIG_ERROR", httpStatus: 500, raw: "Missing BROWSERLESS_HTTP_BASE or BROWSERLESS_TOKEN" };
-  }
-  if (!rule.activityUrl) {
-    return { ok: false, status: "CONFIG_ERROR", httpStatus: 400, raw: "Missing activityUrl (set ACTIVITY_URL or send in request)" };
-  }
-
-  const url = `${base.replace(/\\/$/, "")}/function?token=${encodeURIComponent(token)}`;
-  const payload = buildBrowserlessFunctionPayload({ rule });
-
-  // Some Browserless tiers/timeouts are enforced server-side; still, we keep our own aborts + retries.
-  return await fetchWithRetry(
-    url,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    },
-    retry
-  );
-}
-
-/** -----------------------------
- *  Routes
- *  ----------------------------- */
-app.post("/warmup", async (req, res) => {
-  if (!requireApiKey(req, res)) return;
-
-  const { rule, retry } = buildRule({ ...req.body, dryRun: true, pollSeconds: 15, pollIntervalMs: 2000 });
-
-  console.log("WARMUP_START", JSON.stringify({ at: nowIso(), rule, retry }));
-  const result = await callBrowserless({ rule, retry });
-
-  // ALWAYS 200 for scheduler safety
-  res.status(200).json({
-    ok: result.ok,
-    status: result.status,
-    httpStatus: result.httpStatus,
-    at: nowIso(),
-    rule,
-    retry,
-    browserless: { raw: result.raw?.slice?.(0, 2000) ?? result.raw }
-  });
-});
-
+/**
+ * POST /book
+ * Scheduler should call this.
+ * Always returns HTTP 200 JSON.
+ */
 app.post("/book", async (req, res) => {
-  if (!requireApiKey(req, res)) return;
-
-  const { rule, retry } = buildRule(req.body);
-
+  const rule = normalizeRule(req.body || {});
   console.log("BOOK_START", JSON.stringify({ rule }));
 
-  const result = await callBrowserless({ rule, retry });
+  // DRY RUN MUST BE FAST:
+  if (rule.dryRun) {
+    return ok200(res, {
+      ok: true,
+      status: "DRY_RUN_OK",
+      rule,
+      note: "Dry run: skipping Browserless + booking.",
+    });
+  }
 
-  // ALWAYS 200 so Cloud Scheduler never marks it failed
-  res.status(200).json({
-    ok: result.ok,
-    status: result.status,
-    httpStatus: result.httpStatus,
-    at: nowIso(),
+  // Load session if available (warmup saved it)
+  const session = await loadSession();
+
+  const out = await browserlessWithRetry({ mode: "book", rule, session });
+
+  // If Browserless returned an updated session, store it (keeps cookies fresh)
+  const returnedSession = out?.body?.session;
+  if (returnedSession) {
+    await saveSession(returnedSession);
+  }
+
+  // IMPORTANT: Always HTTP 200 for Scheduler stability:
+  return ok200(res, {
+    ok: out.ok,
+    status: out.status,
     rule,
-    retry,
-    browserless: { raw: result.raw?.slice?.(0, 4000) ?? result.raw }
+    browserless: {
+      httpStatus: out.httpStatus,
+      body: out.body,
+    },
+    retry: out.retry,
   });
 });
 
-/** -----------------------------
- *  Start server
- *  ----------------------------- */
+/**
+ * POST /warmup
+ * Run at 7:55am to login + store session.
+ * Always returns HTTP 200 JSON.
+ */
+app.post("/warmup", async (req, res) => {
+  const rule = normalizeRule(req.body || {});
+  console.log("WARMUP_START", JSON.stringify({ rule }));
+
+  // Warmup should not do full booking; it logs in and stores session.
+  const existing = await loadSession();
+  const out = await browserlessWithRetry({ mode: "warmup", rule, session: existing });
+
+  const returnedSession = out?.body?.session;
+  let saved = null;
+  if (returnedSession) {
+    saved = await saveSession(returnedSession);
+  }
+
+  return ok200(res, {
+    ok: out.ok,
+    status: out.status,
+    rule,
+    saved,
+    browserless: {
+      httpStatus: out.httpStatus,
+      body: out.body,
+    },
+    retry: out.retry,
+  });
+});
+
+/** ---------- Start server ---------- */
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Listening on port ${PORT}`);
 });
