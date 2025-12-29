@@ -1,527 +1,452 @@
-/**
- * index.js — Cloud Run (Express) endpoint for Cloud Scheduler
- *
- * Goals:
- * 1) Cloud Scheduler NEVER fails due to your app logic: always return HTTP 200 with JSON.
- * 2) dryRun is FAST (skips Browserless entirely).
- * 3) Browserless timeouts (408), rate limits (429), and 5xx are retryable.
- * 4) Optional “warmup/login before 8am” flow using Firestore session storage.
- *
- * Required ENV (already in your screenshots):
- * - API_KEY                      (your internal x-api-key)
- * - BROWSERLESS_TOKEN
- * - BROWSERLESS_HTTP_BASE        (e.g. https://production-sfo.browserless.io)
- * - AMILIA_EMAIL
- * - AMILIA_PASSWORD
- * - LOCAL_TZ                     (e.g. America/Toronto)
- * - ACTIVITY_URL                 (full activity URL you want)
- *
- * Recommended ENV:
- * - BROWSERLESS_OVERALL_TIMEOUT_MS=540000
- * - BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS=180000   (3 min recommended)
- * - BROWSERLESS_MAX_ATTEMPTS=3
- * - SESSION_STORE=firestore
- * - FIRESTORE_SESSION_DOC=amilia/session        (collection/doc)
- *
- * NOTE:
- * - This file DOES NOT contain your actual booking selectors (site can change).
- * - It gives you a stable framework + where to plug the booking steps.
- */
+'use strict';
 
-"use strict";
+const express = require('express');
 
-const express = require("express");
+// If you're using Node 18+ (Cloud Run default), global fetch exists.
+// If your runtime is older, uncomment the next line:
+// const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: '1mb' }));
 
-/** ---------- Config helpers ---------- */
-const PORT = process.env.PORT || 8080;
+/**
+ * Helpers
+ */
+function envStr(name, def = '') {
+  const v = process.env[name];
+  return (v === undefined || v === null || String(v).trim() === '') ? def : String(v);
+}
 
 function envInt(name, def) {
-  const v = process.env[name];
-  if (v === undefined || v === "") return def;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : def;
+  const raw = process.env[name];
+  const v = parseInt(String(raw ?? ''), 10);
+  return Number.isFinite(v) && v > 0 ? v : def;
 }
 
-const CONFIG = {
-  apiKey: process.env.API_KEY || "",
-  browserless: {
-    token: process.env.BROWSERLESS_TOKEN || "",
-    httpBase: process.env.BROWSERLESS_HTTP_BASE || "https://production-sfo.browserless.io",
-    overallTimeoutMs: envInt("BROWSERLESS_OVERALL_TIMEOUT_MS", 540000),
-    perAttemptTimeoutMs: envInt("BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS", 180000),
-    maxAttempts: envInt("BROWSERLESS_MAX_ATTEMPTS", 3),
-  },
-  amilia: {
-    email: process.env.AMILIA_EMAIL || "",
-    password: process.env.AMILIA_PASSWORD || "",
-  },
-  defaults: {
-    localTz: process.env.LOCAL_TZ || "America/Toronto",
-    activityUrl: process.env.ACTIVITY_URL || "",
-    targetDay: process.env.TARGET_DAY || "Wednesday",
-    eveningStart: process.env.EVENING_START || "13:00",
-    eveningEnd: process.env.EVENING_END || "20:00",
-  },
-  sessionStore: process.env.SESSION_STORE || "memory", // "firestore" recommended
-  firestoreDoc: process.env.FIRESTORE_SESSION_DOC || "amilia/session",
-};
-
-/** ---------- Optional Firestore session storage ---------- */
-let firestore = null;
-async function getFirestore() {
-  if (CONFIG.sessionStore !== "firestore") return null;
-  if (firestore) return firestore;
-  // Lazy-load to avoid crashing if you didn't install it.
-  const { Firestore } = require("@google-cloud/firestore");
-  firestore = new Firestore();
-  return firestore;
+function nowIso() {
+  return new Date().toISOString();
 }
 
-async function saveSession(sessionObj) {
-  if (CONFIG.sessionStore !== "firestore") {
-    inMemorySession = sessionObj;
-    return { store: "memory" };
-  }
-  const fs = await getFirestore();
-  const [col, doc] = CONFIG.firestoreDoc.split("/");
-  await fs.collection(col).doc(doc).set(
-    {
-      updatedAt: new Date().toISOString(),
-      session: sessionObj,
-    },
-    { merge: true }
-  );
-  return { store: "firestore", doc: CONFIG.firestoreDoc };
+function mask(s) {
+  if (!s) return '';
+  const str = String(s);
+  if (str.length <= 6) return '***';
+  return str.slice(0, 3) + '***' + str.slice(-3);
 }
 
-async function loadSession() {
-  if (CONFIG.sessionStore !== "firestore") return inMemorySession || null;
-  const fs = await getFirestore();
-  const [col, doc] = CONFIG.firestoreDoc.split("/");
-  const snap = await fs.collection(col).doc(doc).get();
-  if (!snap.exists) return null;
-  const data = snap.data();
-  return data?.session || null;
-}
-
-let inMemorySession = null; // fallback only
-
-/** ---------- Auth middleware (x-api-key) ---------- */
-function requireApiKey(req, res, next) {
-  // Allow health checks without key:
-  if (req.path === "/" || req.path === "/health") return next();
-
-  const key = req.header("x-api-key") || req.header("X-Api-Key") || "";
-  if (!CONFIG.apiKey) {
-    // If you forgot to set API_KEY, fail safely but still return 200 (Scheduler should not fail).
-    return res.status(200).json({
-      ok: false,
-      status: "MISCONFIGURED",
-      error: "API_KEY env is not set",
-    });
-  }
-  if (key !== CONFIG.apiKey) {
-    return res.status(200).json({
-      ok: false,
-      status: "UNAUTHORIZED",
-      error: "Unauthorized (invalid x-api-key)",
-    });
-  }
-  next();
-}
-app.use(requireApiKey);
-
-/** ---------- Stable response wrapper ----------
- * Always return HTTP 200 to Scheduler, even if booking fails.
+/**
+ * Config: defaults from env, request body can override when Scheduler sends payload.
  */
-function ok200(res, payload) {
-  return res.status(200).json(payload);
-}
-
-function normalizeRule(body) {
+function buildRuleFromEnvAndBody(body = {}) {
   const rule = {
-    targetDay: body?.targetDay ?? CONFIG.defaults.targetDay,
-    eveningStart: body?.eveningStart ?? CONFIG.defaults.eveningStart,
-    eveningEnd: body?.eveningEnd ?? CONFIG.defaults.eveningEnd,
-    timeZone: body?.timeZone ?? CONFIG.defaults.localTz,
-    activityUrl: body?.activityUrl ?? CONFIG.defaults.activityUrl,
-    dryRun: Boolean(body?.dryRun ?? false),
-    pollSeconds: envInt("POLL_SECONDS", body?.pollSeconds ?? 420),
-    pollIntervalMs: envInt("POLL_INTERVAL_MS", body?.pollIntervalMs ?? 3000),
+    // booking window / calendar
+    targetDay: body.targetDay ?? envStr('TARGET_DAY', 'Wednesday'),
+    eveningStart: body.eveningStart ?? envStr('EVENING_START', '17:00'),
+    eveningEnd: body.eveningEnd ?? envStr('EVENING_END', '21:00'),
+    timeZone: body.timeZone ?? envStr('LOCAL_TZ', 'America/Toronto'),
+    activityUrl: body.activityUrl ?? envStr('ACTIVITY_URL', ''),
 
-    // Your extra steps:
-    playerName: body?.playerName ?? "Hari Prashanth Vaidyula",
-    addressFull: body?.addressFull ?? "383 rue des maraichers, quebec, qc, G1C 0K2",
+    // behavior
+    dryRun: body.dryRun ?? false,
+    pollSeconds: Number.isFinite(Number(body.pollSeconds))
+      ? Number(body.pollSeconds)
+      : envInt('POLL_SECONDS', 420),
+    pollIntervalMs: Number.isFinite(Number(body.pollIntervalMs))
+      ? Number(body.pollIntervalMs)
+      : envInt('POLL_INTERVAL_MS', 3000),
+
+    // booking form details you mentioned
+    playerName: body.playerName ?? envStr('PLAYER_NAME', 'Hari Prashanth Vaidyula'),
+    addressFull:
+      body.addressFull ??
+      envStr('ADDRESS_FULL', '383 rue des maraichers, quebec, qc, G1C 0K2'),
   };
 
-  // Basic sanity:
-  if (!rule.activityUrl) {
-    rule._warning = "ACTIVITY_URL not set (or activityUrl not provided in request)";
-  }
   return rule;
 }
 
-/** ---------- Retryable HTTP helper ----------
- * Retries on 408/429/5xx and network errors.
- */
-async function sleep(ms) {
-  await new Promise((r) => setTimeout(r, ms));
-}
-
-function shouldRetryStatus(status) {
-  if (!status) return true; // network/unknown
-  if (status === 408) return true;
-  if (status === 429) return true;
-  if (status >= 500 && status <= 599) return true;
-  return false;
-}
-
-/** ---------- Browserless call ----------
- * We use Browserless /function endpoint so we can run Node code server-side.
- * IMPORTANT: You must keep your function code small and deterministic.
- *
- * If you already had a working Browserless integration before, you can replace
- * browserlessFunctionSource() with your existing one.
- */
-function browserlessUrl() {
-  // Browserless function endpoint:
-  // https://<host>/function?token=<TOKEN>
-  const base = CONFIG.browserless.httpBase.replace(/\/+$/, "");
-  return `${base}/function?token=${encodeURIComponent(CONFIG.browserless.token)}`;
-}
-
-function browserlessFunctionSource() {
-  // This runs inside Browserless. You can (and should) replace selectors here
-  // with your known-working logic. This is a stub framework.
-  //
-  // It returns JSON string; Browserless will return that as the response body.
-  //
-  // Key idea:
-  // - Use the session (cookies/localStorage) if provided
-  // - If not, login and then return session so Cloud Run can store it (warmup)
-  // - During booking run, reuse session to avoid slow login at 8am
-  return `
-module.exports = async ({ page, context, request }) => {
-  const input = (request && request.body) || {};
-  const mode = input.mode || "book"; // "warmup" or "book"
-  const rule = input.rule || {};
-  const session = input.session || null;
-
-  const AMILIA_EMAIL = input.amiliaEmail;
-  const AMILIA_PASSWORD = input.amiliaPassword;
-
-  // Helper: apply cookies
-  async function applySession(sess) {
-    if (!sess) return;
-    try {
-      if (Array.isArray(sess.cookies)) {
-        await context.addCookies(sess.cookies);
-      }
-    } catch (e) {}
-  }
-
-  // Helper: extract cookies
-  async function extractSession() {
-    try {
-      const cookies = await context.cookies();
-      return { cookies };
-    } catch (e) {
-      return null;
-    }
-  }
-
-  // ---- Apply existing session (if any) ----
-  await applySession(session);
-
-  // ---- Go to site ----
-  const url = rule.activityUrl;
-  if (!url) {
-    return JSON.stringify({ ok:false, status:"NO_ACTIVITY_URL" });
-  }
-
-  // Faster defaults
-  await page.setViewport({ width: 1280, height: 800 });
-  page.setDefaultTimeout(45000);
-  page.setDefaultNavigationTimeout(45000);
-
-  // ---- Login flow (stub) ----
-  // You MUST update these selectors based on the actual Amilia login UI.
-  async function ensureLoggedIn() {
-    // Navigate:
-    await page.goto(url, { waitUntil: "domcontentloaded" });
-
-    // Heuristic: if login button exists, login; otherwise assume logged in.
-    const loginButton = await page.$('a[href*="login"], button:has-text("Login"), button:has-text("Sign in")');
-    if (!loginButton) return { didLogin:false };
-
-    // Click login:
-    await loginButton.click().catch(()=>{});
-    await page.waitForTimeout(1000);
-
-    // Fill credentials (replace selectors):
-    const emailSel = 'input[type="email"], input[name="email"]';
-    const passSel = 'input[type="password"], input[name="password"]';
-
-    await page.waitForSelector(emailSel, { timeout: 15000 });
-    await page.fill(emailSel, AMILIA_EMAIL);
-    await page.fill(passSel, AMILIA_PASSWORD);
-
-    // Submit:
-    const submit = await page.$('button[type="submit"], button:has-text("Sign in"), button:has-text("Login")');
-    if (submit) await submit.click();
-
-    // Wait a bit for redirect/session:
-    await page.waitForTimeout(4000);
-
-    return { didLogin:true };
-  }
-
-  // If we’re warmup, login + return session
-  if (mode === "warmup") {
-    const loginRes = await ensureLoggedIn();
-    const newSession = await extractSession();
-    return JSON.stringify({ ok:true, status:"WARMUP_OK", loginRes, session:newSession });
-  }
-
-  // Booking run: make sure logged in too (in case cookies expired)
-  const loginRes = await ensureLoggedIn();
-
-  // ---- Booking steps (stub placeholders) ----
-  // You asked:
-  // 1) Click register exactly when open (8am)
-  // 2) Select player checkbox: "Hari Prashanth Vaidyula"
-  // 3) Address search: "383 rue des maraichers, quebec, qc, G1C 0K2" and pick suggestion
-  //
-  // Replace the selectors below with the real ones from the page.
-  const playerName = rule.playerName || "";
-  const addressFull = rule.addressFull || "";
-
-  // TODO: implement real detection for "registrations open"
-  // For now just return success stub to show flow.
-  const finalSession = await extractSession();
-
-  return JSON.stringify({
-    ok: true,
-    status: "BROWSERLESS_OK",
-    note: "Stub booking flow ran. Replace selectors in browserlessFunctionSource() to actually book.",
-    loginRes,
-    playerName,
-    addressFull,
-    session: finalSession
-  });
-};
-`.trim();
-}
-
-async function callBrowserless({ mode, rule, session }) {
-  const url = browserlessUrl();
-  const source = browserlessFunctionSource();
-
-  const payload = {
-    code: source,
-    context: { stealth: true },
-    // Browserless gives request.body to function as `request.body`
-    // (function runner passes the JSON body you send as request.body).
-    // We'll put our runtime inputs under request.body:
-    // NOTE: Some Browserless deployments accept `payload` as request.body directly.
-    // If your Browserless expects a different format, adapt here.
-    // We use a common pattern: send inputs as top-level keys too.
-    mode,
-    rule,
-    session,
-    amiliaEmail: CONFIG.amilia.email,
-    amiliaPassword: CONFIG.amilia.password,
+function buildRetryConfig() {
+  // NOTE: defaults matter. You currently set per-attempt=180000, overall=540000, attempts=3
+  const retry = {
+    maxAttempts: envInt('BROWSERLESS_MAX_ATTEMPTS', 3),
+    perAttemptTimeoutMs: envInt('BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS', 180000),
+    overallTimeoutMs: envInt('BROWSERLESS_OVERALL_TIMEOUT_MS', 540000),
   };
 
-  // Node 18+ has global fetch on Cloud Run.
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      // Browserless "function" expects { code, context, ... } as body
-      // and then passes the whole body into request.body in many setups.
-      // To be safe, we include everything here.
-      ...payload,
-      // Also duplicate as requestBody-style field that some templates use:
-      data: payload,
-    }),
-    signal: AbortSignal.timeout(CONFIG.browserless.perAttemptTimeoutMs),
-  });
-
-  const text = await resp.text();
-  let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch (e) {
-    json = { raw: text };
-  }
-  return { httpStatus: resp.status, body: json };
+  return retry;
 }
 
-async function browserlessWithRetry({ mode, rule, session }) {
-  const started = Date.now();
-  const attempts = Math.max(1, CONFIG.browserless.maxAttempts);
+/**
+ * Auth: simple x-api-key check.
+ * If you use Cloud Scheduler with OIDC/IAM instead, you can remove this.
+ */
+function requireApiKey(req, res) {
+  const expected = envStr('API_KEY', '');
+  if (!expected) return true; // if not set, allow (not recommended)
+  const got = req.header('x-api-key');
+  if (!got || got !== expected) {
+    res.status(200).json({
+      ok: false,
+      status: 'UNAUTHORIZED',
+      error: 'Unauthorized (invalid x-api-key)',
+    });
+    return false;
+  }
+  return true;
+}
 
-  let last = null;
-  for (let i = 1; i <= attempts; i++) {
-    const elapsed = Date.now() - started;
-    if (elapsed >= CONFIG.browserless.overallTimeoutMs) {
+/**
+ * Browserless call
+ * You said you're using Browserless HTTP base: https://production-sfo.browserless.io
+ *
+ * This implementation uses Browserless "function" endpoint (server-side puppeteer).
+ * You MUST ensure your Browserless plan supports it.
+ *
+ * If you are currently using a different Browserless endpoint in your code,
+ * swap this function to match your current approach.
+ */
+async function callBrowserlessFunction({ script, timeoutMs }) {
+  const base = envStr('BROWSERLESS_HTTP_BASE', 'https://production-sfo.browserless.io').replace(/\/+$/, '');
+  const token = envStr('BROWSERLESS_TOKEN', '');
+  if (!token) {
+    return {
+      ok: false,
+      httpStatus: 500,
+      body: { error: 'Missing BROWSERLESS_TOKEN' },
+      raw: 'Missing BROWSERLESS_TOKEN',
+    };
+  }
+
+  // Browserless "function" endpoint:
+  // POST {base}/function?token=XYZ
+  const url = `${base}/function?token=${encodeURIComponent(token)}`;
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: script }),
+      signal: controller.signal,
+    });
+
+    const text = await r.text();
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch (_) {}
+
+    return {
+      ok: r.ok,
+      httpStatus: r.status,
+      body: parsed ?? { raw: text },
+      raw: text,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      httpStatus: 408, // treat abort/timeouts as 408
+      body: { error: e?.name || 'Error', message: e?.message || String(e) },
+      raw: String(e),
+    };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/**
+ * Retry wrapper
+ */
+async function fetchWithRetry({ runOnce, retry }) {
+  const start = Date.now();
+  const attempts = [];
+
+  for (let attempt = 1; attempt <= retry.maxAttempts; attempt++) {
+    const elapsed = Date.now() - start;
+    const remainingOverall = retry.overallTimeoutMs - elapsed;
+    const attemptTimeout = Math.min(retry.perAttemptTimeoutMs, Math.max(1, remainingOverall));
+
+    if (remainingOverall <= 0) {
+      const msg = `Overall timeout exceeded before attempt ${attempt}`;
       return {
         ok: false,
-        status: "BROWSERLESS_OVERALL_TIMEOUT",
-        retry: { attempts: i - 1, maxAttempts: attempts, elapsedMs: elapsed },
-        last,
+        status: 'BROWSERLESS_TIMEOUT',
+        httpStatus: 408,
+        attempts,
+        message: msg,
       };
     }
 
-    try {
-      const out = await callBrowserless({ mode, rule, session });
-      last = out;
+    const t0 = Date.now();
+    const result = await runOnce({ attempt, timeoutMs: attemptTimeout });
+    const t1 = Date.now();
 
-      if (out.httpStatus >= 200 && out.httpStatus < 300) {
-        // Browserless responded 2xx. Decide if this is "success" logically:
-        if (out.body?.ok === false && out.body?.status) {
-          // Logical failure inside 2xx response -> still "ok" for Scheduler, but booking failed.
-          // Whether to retry depends on inner status.
-          const inner = String(out.body.status || "");
-          const retryableInner = inner.includes("TIMEOUT") || inner.includes("429") || inner.includes("5XX");
-          if (retryableInner && i < attempts) {
-            await sleep(Math.min(2000 * i, 8000));
-            continue;
-          }
-        }
-        return {
-          ok: true,
-          status: "BROWSERLESS_OK",
-          httpStatus: out.httpStatus,
-          body: out.body,
-          retry: { attempts: i, maxAttempts: attempts, elapsedMs: Date.now() - started },
-        };
-      }
+    attempts.push({
+      attempt,
+      attemptTimeoutMs: attemptTimeout,
+      durationMs: t1 - t0,
+      ok: result.ok,
+      httpStatus: result.httpStatus,
+    });
 
-      // Non-2xx:
-      if (shouldRetryStatus(out.httpStatus) && i < attempts) {
-        await sleep(Math.min(2000 * i, 8000));
-        continue;
-      }
-
+    if (result.ok) {
       return {
-        ok: false,
-        status: "BROWSERLESS_HTTP_ERROR",
-        httpStatus: out.httpStatus,
-        body: out.body,
-        retry: { attempts: i, maxAttempts: attempts, elapsedMs: Date.now() - started },
-      };
-    } catch (err) {
-      const msg = err?.name || err?.message || String(err);
-      last = { error: msg };
-
-      // AbortSignal.timeout throws TimeoutError in many environments; treat retryable:
-      const retryable = true;
-      if (retryable && i < attempts) {
-        await sleep(Math.min(2000 * i, 8000));
-        continue;
-      }
-
-      return {
-        ok: false,
-        status: "BROWSERLESS_EXCEPTION",
-        error: msg,
-        retry: { attempts: i, maxAttempts: attempts, elapsedMs: Date.now() - started },
+        ok: true,
+        status: 'BROWSERLESS_OK',
+        httpStatus: 200,
+        attempts,
+        result,
       };
     }
+
+    // retry only on transient errors
+    const retryable = [408, 429, 500, 502, 503, 504].includes(result.httpStatus);
+    console.log('BROWSERLESS_ERR', JSON.stringify({
+      attempt,
+      perAttemptTimeoutMs: attemptTimeout,
+      retryable,
+      httpStatus: result.httpStatus,
+      body: result.body,
+    }));
+
+    if (!retryable || attempt === retry.maxAttempts) {
+      return {
+        ok: false,
+        status: 'BROWSERLESS_HTTP_ERROR',
+        httpStatus: result.httpStatus || 500,
+        attempts,
+        result,
+        message: `fetchWithRetry failed after ${attempt} attempt(s)`,
+      };
+    }
+
+    // simple backoff (2s, 4s, 8s ...)
+    const backoff = Math.min(8000, 1000 * Math.pow(2, attempt));
+    await new Promise(r => setTimeout(r, backoff));
   }
 
   return {
     ok: false,
-    status: "BROWSERLESS_FINAL_FAIL",
-    last,
+    status: 'BROWSERLESS_HTTP_ERROR',
+    httpStatus: 500,
+    attempts,
+    message: 'fetchWithRetry failed unexpectedly',
   };
 }
 
-/** ---------- Routes ---------- */
-app.get("/", (req, res) => ok200(res, { ok: true, status: "OK", service: "amilia-booker" }));
-app.get("/health", (req, res) => ok200(res, { ok: true, status: "HEALTHY" }));
+/**
+ * Build the puppeteer script that runs inside Browserless.
+ * This is where you implement:
+ * - login
+ * - wait for registrations open at 8am
+ * - click register
+ * - select player checkbox "Hari Prashanth Vaidyula"
+ * - proceed
+ * - enter address and select suggestion
+ *
+ * NOTE: selectors are site-specific and you already have them in your working automation.
+ * Replace TODO selectors with your confirmed ones.
+ */
+function buildBrowserlessScript(rule) {
+  // IMPORTANT: keep it minimal to reduce timeouts.
+  // Use request interception, disable images/fonts, reduce load.
+  // This script returns JSON which Browserless will echo back.
+  const email = envStr('AMILIA_EMAIL', '');
+  const password = envStr('AMILIA_PASSWORD', '');
+
+  return `
+module.exports = async ({ page, context }) => {
+  const result = { step: 'start', ok: false };
+
+  // speed up: block heavy assets
+  await page.setRequestInterception(true);
+  page.on('request', (req) => {
+    const type = req.resourceType();
+    if (['image','font','media'].includes(type)) return req.abort();
+    return req.continue();
+  });
+
+  const rule = ${JSON.stringify(rule)};
+  const EMAIL = ${JSON.stringify(email)};
+  const PASSWORD = ${JSON.stringify(password)};
+
+  // Small helper
+  const wait = (ms) => new Promise(r => setTimeout(r, ms));
+
+  try {
+    if (!rule.activityUrl) {
+      return { ok:false, error:'Missing activityUrl' };
+    }
+
+    result.step = 'goto_activity';
+    await page.goto(rule.activityUrl, { waitUntil: 'domcontentloaded' });
+
+    // TODO: ensure logged in BEFORE 8am
+    // If you have a direct login URL, you can go there first.
+    result.step = 'login';
+    // Example placeholders:
+    // await page.click('button:has-text("Sign in")');
+    // await page.type('input[name="email"]', EMAIL, { delay: 20 });
+    // await page.type('input[name="password"]', PASSWORD, { delay: 20 });
+    // await page.click('button[type="submit"]');
+    // await page.waitForNavigation({ waitUntil: 'domcontentloaded' });
+
+    // TODO: navigate to the right day/time window and detect when "Register" becomes available.
+    result.step = 'poll_for_register';
+    // Minimal dummy polling so the script returns quickly during dryRun
+    if (rule.dryRun) {
+      return { ok:true, dryRun:true, message:'Dry run completed', rule };
+    }
+
+    // TODO: replace with real condition check.
+    // Example:
+    // const registerBtn = await page.$('button:has-text("Register")');
+    // if (!registerBtn) throw new Error('Register button not found');
+
+    // TODO: click Register at the right time
+    result.step = 'click_register';
+    // await page.click('button:has-text("Register")');
+
+    // TODO: select player checkbox
+    result.step = 'select_player';
+    // await page.click('label:has-text("Hari Prashanth Vaidyula") input[type="checkbox"]');
+
+    // TODO: proceed/next button
+    result.step = 'proceed';
+    // await page.click('button:has-text("Next")');
+
+    // TODO: enter address, select suggestion
+    result.step = 'address';
+    // await page.type('input[placeholder="Search address"]', rule.addressFull, { delay: 15 });
+    // await page.waitForSelector('.suggestion-item');
+    // await page.click('.suggestion-item:has-text("383 rue des maraichers")');
+
+    result.step = 'done';
+    result.ok = true;
+    return { ok:true, rule, message:'Automation steps completed (placeholders must be filled with real selectors).' };
+  } catch (e) {
+    return { ok:false, step: result.step, error: e.message || String(e), rule };
+  }
+};
+`.trim();
+}
 
 /**
- * POST /book
- * Scheduler should call this.
- * Always returns HTTP 200 JSON.
+ * Health endpoints
  */
-app.post("/book", async (req, res) => {
-  const rule = normalizeRule(req.body || {});
-  console.log("BOOK_START", JSON.stringify({ rule }));
+app.get('/', (_req, res) => res.status(200).send('ok'));
+app.get('/healthz', (_req, res) => res.status(200).json({ ok: true, ts: nowIso() }));
 
-  // DRY RUN MUST BE FAST:
-  if (rule.dryRun) {
-    return ok200(res, {
-      ok: true,
-      status: "DRY_RUN_OK",
+/**
+ * Main Scheduler target:
+ * POST /book
+ */
+app.post('/book', async (req, res) => {
+  // Always return 200 so Scheduler never marks it failed
+  // (Your app will report ok:false in JSON if automation fails)
+  try {
+    if (!requireApiKey(req, res)) return;
+
+    const rule = buildRuleFromEnvAndBody(req.body || {});
+    const retry = buildRetryConfig();
+
+    console.log('BOOK_START', JSON.stringify({ rule }));
+    console.log('RETRY_CONFIG', JSON.stringify({
+      raw: {
+        BROWSERLESS_MAX_ATTEMPTS: process.env.BROWSERLESS_MAX_ATTEMPTS,
+        BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS: process.env.BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS,
+        BROWSERLESS_OVERALL_TIMEOUT_MS: process.env.BROWSERLESS_OVERALL_TIMEOUT_MS,
+      },
+      parsed: retry
+    }));
+
+    const script = buildBrowserlessScript(rule);
+
+    const outcome = await fetchWithRetry({
+      retry,
+      runOnce: async ({ attempt, timeoutMs }) => {
+        const result = await callBrowserlessFunction({
+          script,
+          timeoutMs
+        });
+        // attach for debugging
+        result.attempt = attempt;
+        return result;
+      }
+    });
+
+    if (outcome.ok) {
+      return res.status(200).json({
+        ok: true,
+        status: outcome.status,
+        rule,
+        retry: {
+          attempts: outcome.attempts?.length || 0,
+          maxAttempts: retry.maxAttempts,
+          perAttemptTimeoutMs: retry.perAttemptTimeoutMs,
+          overallTimeoutMs: retry.overallTimeoutMs,
+        },
+        browserless: {
+          httpStatus: outcome.result?.httpStatus,
+          body: outcome.result?.body,
+        }
+      });
+    }
+
+    console.log('BROWSERLESS_FINAL_FAIL', JSON.stringify({
+      message: outcome.message,
+      status: outcome.httpStatus,
+      attempts: outcome.attempts,
+    }));
+
+    return res.status(200).json({
+      ok: false,
+      status: outcome.status,
+      httpStatus: outcome.httpStatus,
       rule,
-      note: "Dry run: skipping Browserless + booking.",
+      retry: {
+        attempts: outcome.attempts?.length || 0,
+        maxAttempts: retry.maxAttempts,
+        perAttemptTimeoutMs: retry.perAttemptTimeoutMs,
+        overallTimeoutMs: retry.overallTimeoutMs,
+      },
+      browserless: {
+        httpStatus: outcome.result?.httpStatus,
+        body: outcome.result?.body,
+        raw: outcome.result?.raw,
+      },
+      error: outcome.message,
+    });
+  } catch (err) {
+    console.log('SERVER_ERR', JSON.stringify({
+      name: err?.name,
+      message: err?.message,
+      stack: err?.stack,
+    }));
+    return res.status(200).json({
+      ok: false,
+      status: 'SERVER_ERROR',
+      error: err?.message || String(err),
     });
   }
-
-  // Load session if available (warmup saved it)
-  const session = await loadSession();
-
-  const out = await browserlessWithRetry({ mode: "book", rule, session });
-
-  // If Browserless returned an updated session, store it (keeps cookies fresh)
-  const returnedSession = out?.body?.session;
-  if (returnedSession) {
-    await saveSession(returnedSession);
-  }
-
-  // IMPORTANT: Always HTTP 200 for Scheduler stability:
-  return ok200(res, {
-    ok: out.ok,
-    status: out.status,
-    rule,
-    browserless: {
-      httpStatus: out.httpStatus,
-      body: out.body,
-    },
-    retry: out.retry,
-  });
 });
 
 /**
- * POST /warmup
- * Run at 7:55am to login + store session.
- * Always returns HTTP 200 JSON.
+ * Start server (Cloud Run uses PORT)
  */
-app.post("/warmup", async (req, res) => {
-  const rule = normalizeRule(req.body || {});
-  console.log("WARMUP_START", JSON.stringify({ rule }));
-
-  // Warmup should not do full booking; it logs in and stores session.
-  const existing = await loadSession();
-  const out = await browserlessWithRetry({ mode: "warmup", rule, session: existing });
-
-  const returnedSession = out?.body?.session;
-  let saved = null;
-  if (returnedSession) {
-    saved = await saveSession(returnedSession);
-  }
-
-  return ok200(res, {
-    ok: out.ok,
-    status: out.status,
-    rule,
-    saved,
-    browserless: {
-      httpStatus: out.httpStatus,
-      body: out.body,
-    },
-    retry: out.retry,
-  });
-});
-
-/** ---------- Start server ---------- */
+const PORT = parseInt(process.env.PORT || '8080', 10);
 app.listen(PORT, () => {
-  console.log(`Listening on port ${PORT}`);
+  console.log(`listening on ${PORT} at ${nowIso()}`);
+  console.log('ENV', JSON.stringify({
+    TARGET_DAY: envStr('TARGET_DAY', ''),
+    EVENING_START: envStr('EVENING_START', ''),
+    EVENING_END: envStr('EVENING_END', ''),
+    LOCAL_TZ: envStr('LOCAL_TZ', ''),
+    ACTIVITY_URL: envStr('ACTIVITY_URL', ''),
+    PLAYER_NAME: envStr('PLAYER_NAME', ''),
+    ADDRESS_FULL: envStr('ADDRESS_FULL', ''),
+    BROWSERLESS_HTTP_BASE: envStr('BROWSERLESS_HTTP_BASE', ''),
+    BROWSERLESS_TOKEN: mask(envStr('BROWSERLESS_TOKEN', '')),
+    API_KEY: mask(envStr('API_KEY', '')),
+  }));
 });
