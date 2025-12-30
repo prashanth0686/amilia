@@ -1,591 +1,469 @@
-/**
- * amilia-booker / index.js
- *
- * Key goals:
- *  - Cloud Scheduler must NEVER fail due to app errors → always respond 200 with JSON.
- *  - Provide fast warmup endpoints: GET / and GET /health (no Browserless usage).
- *  - POST /book triggers Browserless automation (or dryRun) and returns 200 with status.
- *
- * Environment variables expected (Cloud Run):
- *  API_KEY
- *  AMILIA_EMAIL
- *  AMILIA_PASSWORD
- *  BROWSERLESS_TOKEN
- *  BROWSERLESS_HTTP_BASE               (ex: https://production-sfo.browserless.io)
- *  ACTIVITY_URL
- *  TARGET_DAY                          (ex: Wednesday)
- *  EVENING_START                        (ex: 13:00)
- *  EVENING_END                          (ex: 20:00)
- *  LOCAL_TZ                            (ex: America/Toronto)
- *  BROWSERLESS_OVERALL_TIMEOUT_MS      (ex: 540000)
- *  BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS  (ex: 180000)
- *  BROWSERLESS_MAX_ATTEMPTS            (ex: 3)
- *
- * Optional per-request override (POST body):
- *  dryRun, targetDay, eveningStart, eveningEnd, timeZone, activityUrl,
- *  pollSeconds, pollIntervalMs, playerName, addressFull
- */
+'use strict';
 
-"use strict";
-
-const express = require("express");
-const crypto = require("crypto");
-
-// Node 18+ has fetch globally on Cloud Run.
-// If you're on Node 16, uncomment below:
-// const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
+const express = require('express');
+const crypto = require('crypto');
 
 const app = express();
+app.use(express.json({ limit: '1mb' }));
 
-// Scheduler / Browserless requests are JSON
-app.use(express.json({ limit: "1mb" }));
+/**
+ * ENV
+ */
+const API_KEY = process.env.API_KEY || '';
+const AMILIA_EMAIL = process.env.AMILIA_EMAIL || '';
+const AMILIA_PASSWORD = process.env.AMILIA_PASSWORD || '';
 
-/** ---------- Utilities ---------- **/
+const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || '';
+const BROWSERLESS_HTTP_BASE = (process.env.BROWSERLESS_HTTP_BASE || '').replace(/\/+$/, ''); // no trailing slash
+
+// Defaults tuned for Browserless "60s function cap" reality.
+// Keep each Browserless call under ~55s, and do polling in Cloud Run instead.
+const DEFAULTS = {
+  TARGET_DAY: process.env.TARGET_DAY || 'Sunday',
+  EVENING_START: process.env.EVENING_START || '13:00',
+  EVENING_END: process.env.EVENING_END || '20:00',
+  LOCAL_TZ: process.env.LOCAL_TZ || 'America/Toronto',
+  ACTIVITY_URL: process.env.ACTIVITY_URL || '',
+  PLAYER_NAME: process.env.PLAYER_NAME || 'Hari Prashanth Vaidyula',
+  ADDRESS_FULL: process.env.ADDRESS_FULL || '383 rue des maraichers, quebec, qc, G1C 0K2',
+
+  // Cloud Run polling (seconds)
+  POLL_SECONDS: parseInt(process.env.POLL_SECONDS || '420', 10),
+  POLL_INTERVAL_MS: parseInt(process.env.POLL_INTERVAL_MS || '3000', 10),
+
+  // Browserless call behavior
+  // IMPORTANT: keep per-call under 55s unless you know your Browserless plan supports longer.
+  BROWSERLESS_CALL_TIMEOUT_MS: parseInt(process.env.BROWSERLESS_CALL_TIMEOUT_MS || '55000', 10),
+  BROWSERLESS_MAX_ATTEMPTS: parseInt(process.env.BROWSERLESS_MAX_ATTEMPTS || '3', 10),
+  BROWSERLESS_RETRY_DELAY_MS: parseInt(process.env.BROWSERLESS_RETRY_DELAY_MS || '1500', 10),
+};
 
 function nowIso() {
   return new Date().toISOString();
 }
 
-function toInt(v, fallback) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
+function reqId() {
+  return crypto.randomBytes(6).toString('hex');
 }
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function safeJson(res, obj) {
-  // Always 200 for scheduler stability
-  res.status(200).type("application/json").send(JSON.stringify(obj));
+function pick(obj, key, fallback) {
+  return obj && obj[key] !== undefined && obj[key] !== null ? obj[key] : fallback;
 }
 
-function getApiKeyFromReq(req) {
-  // support x-api-key OR ?key=
-  return (
-    req.get("x-api-key") ||
-    req.get("X-API-KEY") ||
-    req.query.key ||
-    req.query.apiKey ||
-    ""
-  );
+function requireApiKey(req, res) {
+  // Your Cloud Run may already be IAM-protected. This is an extra guard.
+  if (!API_KEY) return true; // allow if not set
+  const got = (req.header('x-api-key') || '').trim();
+  if (got && got === API_KEY) return true;
+  res.status(200).json({ ok: false, status: 'UNAUTHORIZED', error: 'Unauthorized (invalid x-api-key)' });
+  return false;
 }
 
-function isAuthorized(req) {
-  const expected = process.env.API_KEY || "";
-  if (!expected) return true; // if no API_KEY configured, don't block (useful for debugging)
-  const got = getApiKeyFromReq(req);
-  return got && got === expected;
-}
-
-function getRuleFromEnvAndBody(body = {}) {
-  const rule = {
-    targetDay: body.targetDay || process.env.TARGET_DAY || "Wednesday",
-    eveningStart: body.eveningStart || process.env.EVENING_START || "13:00",
-    eveningEnd: body.eveningEnd || process.env.EVENING_END || "20:00",
-    timeZone: body.timeZone || process.env.LOCAL_TZ || "America/Toronto",
-    activityUrl: body.activityUrl || process.env.ACTIVITY_URL || "",
-    dryRun: body.dryRun === true || body.dryRun === "true" ? true : false,
-
-    // polling for “registrations open” / time window behavior
-    pollSeconds: toInt(body.pollSeconds, 420), // default 7 minutes
-    pollIntervalMs: toInt(body.pollIntervalMs, 3000),
-
-    // additional booking steps user asked to include
-    playerName: body.playerName || "Hari Prashanth Vaidyula",
-    addressFull:
-      body.addressFull || "383 rue des maraichers, quebec, qc, G1C 0K2",
-  };
-
-  return rule;
-}
-
-function browserlessConfigFromEnv(body = {}) {
-  const overallTimeoutMs = toInt(
-    body.overallTimeoutMs,
-    toInt(process.env.BROWSERLESS_OVERALL_TIMEOUT_MS, 540000)
-  );
-  const perAttemptTimeoutMs = toInt(
-    body.perAttemptTimeoutMs,
-    toInt(process.env.BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS, 180000)
-  );
-  const maxAttempts = toInt(
-    body.maxAttempts,
-    toInt(process.env.BROWSERLESS_MAX_ATTEMPTS, 3)
-  );
-
-  return { overallTimeoutMs, perAttemptTimeoutMs, maxAttempts };
-}
-
-function mask(str) {
-  if (!str) return "";
-  if (str.length <= 6) return "***";
-  return str.slice(0, 2) + "***" + str.slice(-2);
-}
-
-/** ---------- Warmup / health endpoints (NO Browserless) ---------- **/
-
-app.get("/", (req, res) => {
-  res.status(200).send("OK");
-});
-
-app.get("/health", (req, res) => {
-  safeJson(res, {
-    ok: true,
-    status: "healthy",
-    time: nowIso(),
-    service: "amilia-booker",
-  });
-});
-
-/** ---------- Browserless call with retry ---------- **/
-
-async function fetchWithTimeout(url, opts, timeoutMs) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const resp = await fetch(url, { ...opts, signal: controller.signal });
-    return resp;
-  } finally {
-    clearTimeout(t);
+function validateEnvOrThrow() {
+  const missing = [];
+  if (!BROWSERLESS_HTTP_BASE) missing.push('BROWSERLESS_HTTP_BASE');
+  if (!BROWSERLESS_TOKEN) missing.push('BROWSERLESS_TOKEN');
+  if (!AMILIA_EMAIL) missing.push('AMILIA_EMAIL');
+  if (!AMILIA_PASSWORD) missing.push('AMILIA_PASSWORD');
+  if (missing.length) {
+    const err = new Error(`Missing env: ${missing.join(', ')}`);
+    err.code = 'MISSING_ENV';
+    throw err;
   }
 }
 
-async function fetchWithRetry({ url, options, perAttemptTimeoutMs, maxAttempts }) {
-  let lastErr = null;
+function buildRule(body = {}) {
+  return {
+    targetDay: pick(body, 'targetDay', DEFAULTS.TARGET_DAY),
+    eveningStart: pick(body, 'eveningStart', DEFAULTS.EVENING_START),
+    eveningEnd: pick(body, 'eveningEnd', DEFAULTS.EVENING_END),
+    timeZone: pick(body, 'timeZone', DEFAULTS.LOCAL_TZ),
+    activityUrl: pick(body, 'activityUrl', DEFAULTS.ACTIVITY_URL),
+    playerName: pick(body, 'playerName', DEFAULTS.PLAYER_NAME),
+    addressFull: pick(body, 'addressFull', DEFAULTS.ADDRESS_FULL),
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    dryRun: Boolean(pick(body, 'dryRun', false)),
+    pollSeconds: parseInt(pick(body, 'pollSeconds', DEFAULTS.POLL_SECONDS), 10),
+    pollIntervalMs: parseInt(pick(body, 'pollIntervalMs', DEFAULTS.POLL_INTERVAL_MS), 10),
+  };
+}
+
+// Browserless /function runner with retries (actual polling happens in Cloud Run)
+async function callBrowserlessFunction({ code, context, timeoutMs }) {
+  validateEnvOrThrow();
+
+  // Browserless function endpoint
+  const url = `${BROWSERLESS_HTTP_BASE}/function?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
+
+  const payload = {
+    code,
+    context,
+  };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    const text = await resp.text();
+    let json;
     try {
-      const resp = await fetchWithTimeout(url, options, perAttemptTimeoutMs);
+      json = JSON.parse(text);
+    } catch {
+      json = { raw: text };
+    }
 
-      // Browserless may return non-2xx on some errors; still capture body
-      const text = await resp.text().catch(() => "");
-      return { ok: resp.ok, status: resp.status, text, attempt };
-    } catch (err) {
-      lastErr = err;
-      // small backoff
-      await sleep(Math.min(1500 * attempt, 5000));
+    if (!resp.ok) {
+      const err = new Error(`Browserless HTTP ${resp.status}`);
+      err.httpStatus = resp.status;
+      err.payload = json;
+      throw err;
+    }
+
+    return { ok: true, data: json };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function callBrowserlessWithRetry({ code, context, timeoutMs, maxAttempts }) {
+  const attempts = Math.max(1, maxAttempts || DEFAULTS.BROWSERLESS_MAX_ATTEMPTS);
+  let lastErr;
+
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await callBrowserlessFunction({ code, context, timeoutMs });
+    } catch (e) {
+      lastErr = e;
+      // If we got an explicit Browserless 408, wait and retry (but keep total time small)
+      await sleep(DEFAULTS.BROWSERLESS_RETRY_DELAY_MS);
     }
   }
 
-  const e = new Error(`fetchWithRetry failed after ${maxAttempts} attempt(s)`);
-  e.cause = lastErr;
-  throw e;
+  const status = lastErr?.httpStatus || 408;
+  return {
+    ok: false,
+    status,
+    error: lastErr?.message || 'Browserless timeout',
+    details: lastErr?.payload || null,
+  };
 }
 
-/** ---------- Browserless automation payload (Function API) ---------- **/
-
-function buildBrowserlessFunctionCode() {
-  /**
-   * NOTE:
-   * This Browserless “function” runs inside their environment with Puppeteer available.
-   * You MUST adjust selectors below if Amilia UI differs.
-   *
-   * We keep it defensive:
-   *  - login early
-   *  - keep polling until registration open / time available
-   *  - select player checkbox by visible label (playerName)
-   *  - fill address and pick from dropdown
-   */
-  return `
+/**
+ * Browserless function code
+ * - Warmup intent: login + quick check (<55s)
+ * - Book intent: quick "is Register available?" attempt, do minimal steps, return state
+ *
+ * NOTE: Selectors may need tweaking based on Amilia DOM.
+ */
+const BROWSERLESS_FN = `
 module.exports = async ({ page, context }) => {
   const {
-    activityUrl,
+    intent,
     email,
     password,
+    activityUrl,
+    playerName,
+    addressFull,
+    dryRun,
     targetDay,
     eveningStart,
     eveningEnd,
-    timeZone,
-    pollSeconds,
-    pollIntervalMs,
-    playerName,
-    addressFull,
-    dryRun
+    timeBudgetMs,
   } = context;
 
-  const log = (...args) => console.log("[BL]", ...args);
+  const startedAt = Date.now();
+  const deadline = startedAt + timeBudgetMs;
 
-  // Basic hardening
-  page.setDefaultTimeout(45000);
-  page.setDefaultNavigationTimeout(60000);
-
-  const start = Date.now();
-  const deadline = start + (pollSeconds * 1000);
-
-  const goto = async (url) => {
-    await page.goto(url, { waitUntil: "domcontentloaded" });
+  const step = async (name, fn) => {
+    const t = Date.now();
+    if (t > deadline) throw new Error('Time budget exceeded');
+    try {
+      const out = await fn();
+      return { name, ok: true, ms: Date.now() - t, out };
+    } catch (e) {
+      return { name, ok: false, ms: Date.now() - t, error: e.message || String(e) };
+    }
   };
 
-  // --- Step 1: Go to activity page (forces auth flow if not logged in) ---
-  log("Going to activityUrl:", activityUrl);
-  await goto(activityUrl);
-  await page.waitForTimeout(1500);
+  const steps = [];
+  const result = { intent, dryRun, steps };
 
-  // --- Step 2: Login if login form appears ---
-  // These selectors are common; you may need to tweak depending on Amilia.
-  const tryLogin = async () => {
-    // Heuristics: find email/password inputs
-    const emailSel = 'input[type="email"], input[name="email"], input#email';
-    const passSel = 'input[type="password"], input[name="password"], input#password';
+  // Conservative defaults for page timing
+  page.setDefaultTimeout(15000);
+  page.setDefaultNavigationTimeout(20000);
 
-    const emailEl = await page.$(emailSel);
-    const passEl = await page.$(passSel);
+  // --- WARMUP: login only, fast
+  if (intent === 'warmup') {
+    steps.push(await step('goto_login', async () => {
+      await page.goto('https://app.amilia.com/', { waitUntil: 'domcontentloaded' });
+      return true;
+    }));
 
-    if (!emailEl || !passEl) {
-      return false;
-    }
+    // Try to click Sign in / Log in if present; otherwise this is still a "warm" success.
+    steps.push(await step('try_open_login', async () => {
+      const signIn = await page.$('a[href*="login"], a[href*="sign-in"], button:has-text("Sign in"), button:has-text("Log in")');
+      if (signIn) await signIn.click();
+      return true;
+    }));
 
-    log("Login form detected, attempting login...");
-    await page.click(emailSel, { clickCount: 3 }).catch(() => {});
-    await page.type(emailSel, email, { delay: 10 });
+    steps.push(await step('try_fill_login', async () => {
+      // These selectors often differ; we try a few common patterns:
+      const emailSel = 'input[type="email"], input[name*="email" i], input[id*="email" i]';
+      const passSel = 'input[type="password"], input[name*="pass" i], input[id*="pass" i]';
+      const emailEl = await page.$(emailSel);
+      const passEl = await page.$(passSel);
 
-    await page.click(passSel, { clickCount: 3 }).catch(() => {});
-    await page.type(passSel, password, { delay: 10 });
+      if (!emailEl || !passEl) return { skipped: true };
 
-    // Submit button heuristics
-    const btnSel = 'button[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Connexion")';
-    const btn = await page.$(btnSel);
-    if (btn) {
-      await Promise.allSettled([
-        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 }),
-        btn.click()
-      ]);
-    } else {
-      // fallback: press Enter
-      await page.keyboard.press("Enter").catch(() => {});
-      await page.waitForTimeout(2000);
-    }
+      await emailEl.click({ clickCount: 3 });
+      await emailEl.type(email, { delay: 10 });
+      await passEl.click({ clickCount: 3 });
+      await passEl.type(password, { delay: 10 });
 
-    log("Login attempt finished");
+      // Try submit
+      const btn = await page.$('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in")');
+      if (btn) await btn.click();
+      return { attempted: true };
+    }));
+
+    steps.push(await step('done', async () => ({ warm: true })));
+    result.status = 'WARMUP_OK';
+    return result;
+  }
+
+  // --- BOOK: quick try, return "not_open" if register not available
+  steps.push(await step('goto_activity', async () => {
+    if (!activityUrl) throw new Error('Missing activityUrl');
+    await page.goto(activityUrl, { waitUntil: 'domcontentloaded' });
     return true;
-  };
+  }));
 
-  await tryLogin().catch((e) => log("Login error (ignored):", String(e)));
-
-  // --- Step 3: Poll until registration open / calendar selectable ---
-  // We keep polling until we see something that looks like an enabled "Register" button.
-  const isRegisterOpen = async () => {
-    // try a few common register selectors/texts
+  steps.push(await step('find_register', async () => {
+    // Try multiple patterns; adjust if needed
     const candidates = [
       'button:has-text("Register")',
-      'button:has-text("Register now")',
+      'a:has-text("Register")',
       'button:has-text("Inscription")',
-      'button:has-text("S\\'inscrire")'
+      'a:has-text("Inscription")',
     ];
+
     for (const sel of candidates) {
       const el = await page.$(sel);
       if (el) {
-        const disabled = await el.evaluate((b) => b.disabled || b.getAttribute("aria-disabled") === "true").catch(() => true);
-        if (!disabled) return { open: true, selector: sel };
+        const disabled = await page.evaluate((b) => b.disabled === true, el).catch(() => false);
+        return { found: sel, disabled };
       }
     }
-    return { open: false, selector: null };
-  };
+    return { found: null };
+  }));
 
-  while (Date.now() < deadline) {
-    const r = await isRegisterOpen();
-    if (r.open) {
-      log("Registration looks open. selector:", r.selector);
-      if (dryRun) {
-        return { ok: true, status: "DRYRUN_REGISTER_OPEN", selector: r.selector };
-      }
-      await page.click(r.selector);
-      await page.waitForTimeout(1500);
-      break;
-    }
+  // If register isn’t present/available, return fast so Cloud Run can poll.
+  const regStep = steps.find(s => s.name === 'find_register');
+  const regFound = regStep && regStep.ok && regStep.out && regStep.out.found;
+  const regDisabled = regStep && regStep.ok && regStep.out && regStep.out.disabled;
 
-    // Refresh/poke the UI
-    await page.waitForTimeout(pollIntervalMs);
-    // Light refresh every ~15s
-    if ((Date.now() - start) % 15000 < pollIntervalMs) {
-      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-    }
+  if (!regFound || regDisabled) {
+    result.status = 'NOT_OPEN_YET';
+    return result;
   }
 
-  if (Date.now() >= deadline) {
-    return { ok: false, status: "REGISTER_NOT_OPEN_IN_TIME" };
-  }
-
-  // --- Step 4: Select player checkbox (label match) ---
-  // Looks for the player name text and clicks nearby checkbox.
-  const selectPlayerByName = async (name) => {
-    // Try label text search
-    const xpath = \`//*[contains(normalize-space(), "\${name}")]\`;
-    const nodes = await page.$x(xpath);
-    if (!nodes.length) return false;
-
-    for (const n of nodes) {
-      // walk up and find input checkbox
-      const checkbox = await n.$('input[type="checkbox"]').catch(() => null);
-      if (checkbox) {
-        const checked = await checkbox.evaluate((c) => c.checked).catch(() => false);
-        if (!checked) await checkbox.click().catch(() => {});
-        return true;
-      }
-      // try nearest preceding checkbox
-      const cb2 = await page.evaluateHandle((el) => {
-        const root = el.closest("label, div, li, tr") || el.parentElement;
-        if (!root) return null;
-        return root.querySelector('input[type="checkbox"]');
-      }, n).catch(() => null);
-
-      if (cb2) {
-        const asEl = cb2.asElement();
-        if (asEl) {
-          const checked = await asEl.evaluate((c) => c.checked).catch(() => false);
-          if (!checked) await asEl.click().catch(() => {});
-          return true;
-        }
-      }
-    }
-    return false;
-  };
-
-  const playerOk = await selectPlayerByName(playerName);
-  log("Player selection:", playerOk);
-
-  // Proceed/Next button
-  const clickNext = async () => {
-    const nextSel = 'button:has-text("Next"), button:has-text("Continue"), button:has-text("Proceed"), button:has-text("Suivant"), button:has-text("Continuer")';
-    const btn = await page.$(nextSel);
-    if (btn) {
-      await btn.click();
-      await page.waitForTimeout(1200);
-      return true;
-    }
-    return false;
-  };
-
-  await clickNext().catch(() => {});
-
-  // --- Step 5: Address input + choose suggestion ---
-  const fillAddress = async (address) => {
-    // Common address/autocomplete selectors
-    const addrSel = 'input[autocomplete="street-address"], input[name*="address" i], input[id*="address" i], input[placeholder*="address" i]';
-    const addrEl = await page.$(addrSel);
-    if (!addrEl) return false;
-
-    await page.click(addrSel, { clickCount: 3 }).catch(() => {});
-    await page.type(addrSel, address, { delay: 10 });
-    await page.waitForTimeout(1200);
-
-    // try to pick first dropdown option
-    const optionSel = '[role="option"], li[role="option"], .pac-item, ul li';
-    const opt = await page.$(optionSel);
-    if (opt) {
-      await opt.click().catch(() => {});
-      await page.waitForTimeout(800);
-      return true;
-    }
-
-    // fallback: ArrowDown + Enter
-    await page.keyboard.press("ArrowDown").catch(() => {});
-    await page.keyboard.press("Enter").catch(() => {});
-    await page.waitForTimeout(800);
+  steps.push(await step('click_register', async () => {
+    await page.click(regFound);
     return true;
-  };
+  }));
 
-  const addrOk = await fillAddress(addressFull);
-  log("Address fill:", addrOk);
-
-  // Next again
-  await clickNext().catch(() => {});
-
-  // --- Final: Try to locate final submit/confirm ---
-  const trySubmit = async () => {
-    const submitSel = 'button:has-text("Confirm"), button:has-text("Submit"), button:has-text("Pay"), button:has-text("Complete"), button[type="submit"], button:has-text("Confirmer")';
-    const btn = await page.$(submitSel);
-    if (!btn) return false;
-
-    if (dryRun) {
-      return "DRYRUN_READY_TO_SUBMIT";
+  // Player selection step (checkbox)
+  steps.push(await step('select_player', async () => {
+    // This is highly DOM-dependent. We use label text fallback.
+    const labelXpath = \`//label[contains(., "\${playerName}")]\`;
+    const [label] = await page.$x(labelXpath);
+    if (label) {
+      await label.click();
+      return { selected: true };
     }
-    await btn.click().catch(() => {});
-    await page.waitForTimeout(2000);
-    return "SUBMIT_CLICKED";
-  };
+    // fallback: checkbox near text
+    const [cb] = await page.$x(\`//span[contains(., "\${playerName}")]/preceding::input[@type="checkbox"][1]\`);
+    if (cb) { await cb.click(); return { selected: true }; }
+    return { selected: false };
+  }));
 
-  const submitResult = await trySubmit().catch(() => "SUBMIT_FAILED");
+  // Proceed/Next
+  steps.push(await step('click_next', async () => {
+    const btn = await page.$('button:has-text("Next"), button:has-text("Proceed"), button:has-text("Continue"), button:has-text("Suivant"), button:has-text("Continuer")');
+    if (btn) { await btn.click(); return true; }
+    return false;
+  }));
 
-  return {
+  // Address entry
+  steps.push(await step('fill_address', async () => {
+    const input = await page.$('input[placeholder*="address" i], input[name*="address" i], input[id*="address" i]');
+    if (!input) return { filled: false };
+
+    await input.click({ clickCount: 3 });
+    await input.type(addressFull, { delay: 10 });
+
+    // Wait a bit for suggestions dropdown and select first match
+    await page.waitForTimeout(800);
+    const option = await page.$('li[role="option"], div[role="option"]');
+    if (option) { await option.click(); return { filled: true, picked: true }; }
+    return { filled: true, picked: false };
+  }));
+
+  // Final submit (if not dryRun)
+  steps.push(await step('final_submit', async () => {
+    if (dryRun) return { skipped: true };
+    const btn = await page.$('button:has-text("Confirm"), button:has-text("Submit"), button:has-text("Register"), button:has-text("Confirmer"), button:has-text("Soumettre")');
+    if (btn) { await btn.click(); return { submitted: true }; }
+    return { submitted: false };
+  }));
+
+  result.status = dryRun ? 'DRYRUN_DONE' : 'BOOK_ATTEMPT_DONE';
+  return result;
+};
+`;
+
+/**
+ * Routes
+ */
+
+// Health check (useful for you + monitoring)
+app.get('/health', (req, res) => {
+  res.status(200).json({
     ok: true,
-    status: "FLOW_DONE",
-    playerOk,
-    addrOk,
-    submitResult
-  };
-};`;
-}
-
-/** ---------- POST /book (Scheduler calls this) ---------- **/
-
-app.post("/book", async (req, res) => {
-  const reqId = crypto.randomUUID();
-  const startedAt = Date.now();
-
-  // Auth gate (return 200 but with status UNAUTHORIZED so Scheduler doesn't 5xx)
-  if (!isAuthorized(req)) {
-    return safeJson(res, {
-      ok: false,
-      status: "UNAUTHORIZED",
-      error: "Unauthorized (invalid x-api-key)",
-      reqId,
-      time: nowIso(),
-    });
-  }
-
-  const rule = getRuleFromEnvAndBody(req.body || {});
-  const retry = browserlessConfigFromEnv(req.body || {});
-
-  console.log(
-    "BOOK_START",
-    JSON.stringify({
-      reqId,
-      rule,
-      retry: { ...retry },
-      env: {
-        BROWSERLESS_HTTP_BASE: process.env.BROWSERLESS_HTTP_BASE,
-        BROWSERLESS_TOKEN: mask(process.env.BROWSERLESS_TOKEN),
-        ACTIVITY_URL: process.env.ACTIVITY_URL,
-      },
-    })
-  );
-
-  // If dryRun, you can optionally skip Browserless entirely
-  // but leaving Browserless enabled helps validate selectors.
-  const browserlessBase = process.env.BROWSERLESS_HTTP_BASE || "";
-  const token = process.env.BROWSERLESS_TOKEN || "";
-  const email = process.env.AMILIA_EMAIL || "";
-  const password = process.env.AMILIA_PASSWORD || "";
-
-  if (!browserlessBase || !token) {
-    return safeJson(res, {
-      ok: false,
-      status: "MISSING_BROWSERLESS_CONFIG",
-      reqId,
-      rule,
-      error: "BROWSERLESS_HTTP_BASE or BROWSERLESS_TOKEN not set",
-    });
-  }
-
-  if (!rule.activityUrl) {
-    return safeJson(res, {
-      ok: false,
-      status: "MISSING_ACTIVITY_URL",
-      reqId,
-      rule,
-      error: "ACTIVITY_URL not set and not provided in body",
-    });
-  }
-
-  // Browserless Function API endpoint:
-  // Many Browserless deployments accept /function?token=...
-  const url = `${browserlessBase.replace(/\/+$/, "")}/function?token=${encodeURIComponent(
-    token
-  )}`;
-
-  const functionCode = buildBrowserlessFunctionCode();
-
-  const payload = {
-    code: functionCode,
-    context: {
-      activityUrl: rule.activityUrl,
-      email,
-      password,
-      targetDay: rule.targetDay,
-      eveningStart: rule.eveningStart,
-      eveningEnd: rule.eveningEnd,
-      timeZone: rule.timeZone,
-      pollSeconds: rule.pollSeconds,
-      pollIntervalMs: rule.pollIntervalMs,
-      playerName: rule.playerName,
-      addressFull: rule.addressFull,
-      dryRun: rule.dryRun,
-    },
-  };
-
-  try {
-    const bl = await fetchWithRetry({
-      url,
-      options: {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload),
-      },
-      perAttemptTimeoutMs: retry.perAttemptTimeoutMs,
-      maxAttempts: retry.maxAttempts,
-    });
-
-    // Try parse JSON from browserless, but keep raw text too
-    let parsed = null;
-    try {
-      parsed = JSON.parse(bl.text);
-    } catch (_) {}
-
-    const elapsedMs = Date.now() - startedAt;
-
-    // Browserless often returns 408 when it times out.
-    if (!bl.ok) {
-      console.log(
-        "BROWSERLESS_FINAL_FAIL",
-        JSON.stringify({ message: `fetchWithRetry failed after ${bl.attempt} attempt(s)`, status: bl.status })
-      );
-    }
-
-    return safeJson(res, {
-      ok: bl.ok,
-      status: bl.ok ? "BROWSERLESS_OK" : "BROWSERLESS_HTTP_ERROR",
-      httpStatus: bl.status,
-      reqId,
-      rule,
-      retry: {
-        attempts: bl.attempt,
-        perAttemptTimeoutMs: retry.perAttemptTimeoutMs,
-        overallTimeoutMs: retry.overallTimeoutMs,
-        maxAttempts: retry.maxAttempts,
-      },
-      browserless: {
-        parsed,
-        raw: bl.text?.slice(0, 2000) || "", // limit size
-      },
-      timing: { elapsedMs },
-    });
-  } catch (err) {
-    const elapsedMs = Date.now() - startedAt;
-    console.log(
-      "BROWSERLESS_FINAL_FAIL",
-      JSON.stringify({
-        message: err?.message || "Unknown error",
-        status: 408, // treat as timeout-like for logging consistency
-      })
-    );
-
-    // Still 200 so Scheduler won't mark job failed due to 5xx
-    return safeJson(res, {
-      ok: false,
-      status: "BROWSERLESS_EXCEPTION",
-      reqId,
-      rule,
-      error: err?.message || String(err),
-      timing: { elapsedMs },
-    });
-  }
-});
-
-/** ---------- Fallback for unknown routes ---------- **/
-app.use((req, res) => {
-  safeJson(res, {
-    ok: false,
-    status: "NOT_FOUND",
-    path: req.path,
-    method: req.method,
+    status: 'OK',
     time: nowIso(),
+    service: 'amilia-booker',
   });
 });
 
-/** ---------- Start server ---------- **/
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`amilia-booker listening on ${PORT}`);
+// Alias root -> avoid "Cannot POST /"
+app.post('/', (req, res) => {
+  req.url = '/book';
+  return app._router.handle(req, res);
+});
+
+// Job A: Warmup (fast, should not hit 408)
+app.post('/warmup', async (req, res) => {
+  if (!requireApiKey(req, res)) return;
+
+  const id = reqId();
+  const rule = buildRule(req.body || {});
+  console.log('WARMUP_START', JSON.stringify({ id, rule }));
+
+  try {
+    const out = await callBrowserlessWithRetry({
+      code: BROWSERLESS_FN,
+      context: {
+        intent: 'warmup',
+        email: AMILIA_EMAIL,
+        password: AMILIA_PASSWORD,
+        activityUrl: rule.activityUrl,
+        playerName: rule.playerName,
+        addressFull: rule.addressFull,
+        dryRun: true,
+        targetDay: rule.targetDay,
+        eveningStart: rule.eveningStart,
+        eveningEnd: rule.eveningEnd,
+        timeBudgetMs: Math.min(DEFAULTS.BROWSERLESS_CALL_TIMEOUT_MS, 55000),
+      },
+      timeoutMs: Math.min(DEFAULTS.BROWSERLESS_CALL_TIMEOUT_MS, 55000),
+      maxAttempts: DEFAULTS.BROWSERLESS_MAX_ATTEMPTS,
+    });
+
+    if (!out.ok) {
+      console.log('BROWSERLESS_FINAL_FAIL', JSON.stringify({ id, message: out.error, status: out.status }));
+      return res.status(200).json({ ok: false, status: 'BROWSERLESS_HTTP_ERROR', httpStatus: out.status, rule, browserless: out.details || { raw: out.error } });
+    }
+
+    return res.status(200).json({ ok: true, status: 'WARMUP_OK', rule, browserless: out.data });
+  } catch (e) {
+    console.log('WARMUP_EXCEPTION', JSON.stringify({ id, error: e.message || String(e) }));
+    return res.status(200).json({ ok: false, status: 'EXCEPTION', error: e.message || String(e), rule });
+  }
+});
+
+// Job B: Booking (polling happens in Cloud Run, each Browserless call stays <55s)
+app.post('/book', async (req, res) => {
+  if (!requireApiKey(req, res)) return;
+
+  const id = reqId();
+  const rule = buildRule(req.body || {});
+  console.log('BOOK_START', JSON.stringify({ id, rule }));
+
+  try {
+    const deadline = Date.now() + Math.max(5, rule.pollSeconds) * 1000;
+    const interval = Math.max(500, rule.pollIntervalMs);
+
+    while (Date.now() < deadline) {
+      const out = await callBrowserlessWithRetry({
+        code: BROWSERLESS_FN,
+        context: {
+          intent: 'book',
+          email: AMILIA_EMAIL,
+          password: AMILIA_PASSWORD,
+          activityUrl: rule.activityUrl,
+          playerName: rule.playerName,
+          addressFull: rule.addressFull,
+          dryRun: rule.dryRun,
+          targetDay: rule.targetDay,
+          eveningStart: rule.eveningStart,
+          eveningEnd: rule.eveningEnd,
+          timeBudgetMs: Math.min(DEFAULTS.BROWSERLESS_CALL_TIMEOUT_MS, 55000),
+        },
+        timeoutMs: Math.min(DEFAULTS.BROWSERLESS_CALL_TIMEOUT_MS, 55000),
+        maxAttempts: DEFAULTS.BROWSERLESS_MAX_ATTEMPTS,
+      });
+
+      if (!out.ok) {
+        console.log('BROWSERLESS_FINAL_FAIL', JSON.stringify({ id, message: out.error, status: out.status }));
+        // Keep 200 so Scheduler never fails, but report the error in JSON.
+        return res.status(200).json({
+          ok: false,
+          status: 'BROWSERLESS_HTTP_ERROR',
+          httpStatus: out.status,
+          rule,
+          browserless: out.details || { raw: out.error },
+          retry: { attempts: DEFAULTS.BROWSERLESS_MAX_ATTEMPTS, callTimeoutMs: Math.min(DEFAULTS.BROWSERLESS_CALL_TIMEOUT_MS, 55000) },
+        });
+      }
+
+      const data = out.data;
+      const status = data && data.status;
+
+      // If not open, wait and poll again
+      if (status === 'NOT_OPEN_YET') {
+        await sleep(interval);
+        continue;
+      }
+
+      // Anything else: we attempted something — return the payload
+      return res.status(200).json({ ok: true, status: 'BROWSERLESS_OK', rule, browserless: data });
+    }
+
+    return res.status(200).json({
+      ok: false,
+      status: 'POLL_TIMEOUT',
+      rule,
+      message: `No booking opportunity within ${rule.pollSeconds}s`,
+    });
+  } catch (e) {
+    console.log('BOOK_EXCEPTION', JSON.stringify({ id, error: e.message || String(e) }));
+    return res.status(200).json({ ok: false, status: 'EXCEPTION', error: e.message || String(e), rule });
+  }
+});
+
+const port = parseInt(process.env.PORT || '8080', 10);
+app.listen(port, '0.0.0.0', () => {
+  console.log(`Listening on ${port}`);
 });
