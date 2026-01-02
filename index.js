@@ -1,158 +1,204 @@
-import express from "express";
-import fetch from "node-fetch";
+'use strict';
+
+const express = require('express');
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
 
-const PORT = process.env.PORT || 8080;
+// ---------- middleware ----------
+app.use(express.json({ limit: '1mb' }));
 
-/* =========================
-   HEALTH CHECK (REQUIRED)
-   ========================= */
-app.get("/health", (req, res) => {
-  res.status(200).json({ ok: true, status: "healthy" });
+// Basic request logging (helps Cloud Run logs)
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    console.log(
+      JSON.stringify({
+        severity: 'INFO',
+        msg: 'request',
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        durationMs: Date.now() - start,
+      })
+    );
+  });
+  next();
 });
 
-/* =========================
-   ROOT ROUTE (OPTIONAL)
-   ========================= */
-app.get("/", (req, res) => {
-  res.status(200).json({ ok: true, service: "amilia-booker" });
-});
-
-/* =========================
-   AUTH
-   ========================= */
-function requireApiKey(req) {
-  const apiKey = req.headers["x-api-key"];
-  return apiKey && apiKey === process.env.API_KEY;
+// ---------- helpers ----------
+function getHeader(req, name) {
+  // Express lowercases header keys
+  return req.headers[String(name).toLowerCase()];
 }
 
-/* =========================
-   BOOK ENDPOINT
-   ========================= */
-app.post("/book", async (req, res) => {
-  if (!requireApiKey(req)) {
-    return res.status(200).json({
-      ok: false,
-      status: "UNAUTHORIZED",
-      message: "Invalid x-api-key",
-    });
+function requireApiKey(req) {
+  const expected = process.env.API_KEY;
+  if (!expected) {
+    // Misconfiguration - fail closed
+    return { ok: false, status: 500, message: 'API_KEY env var not set' };
   }
 
-  const {
-    BROWSERLESS_HTTP_BASE,
-    BROWSERLESS_TOKEN,
-    BROWSERLESS_OVERALL_TIMEOUT_MS = "540000",
-    BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS = "180000",
-    BROWSERLESS_MAX_ATTEMPTS = "3",
-    AMILIA_EMAIL,
-    AMILIA_PASSWORD,
-  } = process.env;
+  const provided =
+    getHeader(req, 'x-api-key') ||
+    getHeader(req, 'x-api_key') ||
+    getHeader(req, 'authorization'); // optional fallback
 
-  if (!BROWSERLESS_HTTP_BASE || !BROWSERLESS_TOKEN) {
-    return res.status(200).json({
-      ok: false,
-      status: "CONFIG_ERROR",
-      message: "Browserless not configured",
-    });
-  }
+  if (!provided) return { ok: false, status: 401, message: 'Missing API key' };
 
-  const rule = {
-    targetDay: req.body.targetDay || process.env.TARGET_DAY,
-    eveningStart: req.body.eveningStart || process.env.EVENING_START,
-    eveningEnd: req.body.eveningEnd || process.env.EVENING_END,
-    timeZone: req.body.timeZone || process.env.LOCAL_TZ,
-    activityUrl: req.body.activityUrl || process.env.ACTIVITY_URL,
-    pollSeconds: Number(req.body.pollSeconds || 540),
-    pollIntervalMs: Number(req.body.pollIntervalMs || 3000),
-    dryRun: Boolean(req.body.dryRun),
-    playerName: req.body.playerName || process.env.PLAYER_NAME,
-    addressFull: req.body.addressFull || process.env.ADDRESS_FULL,
+  // If user sends "Bearer <key>"
+  const token = String(provided).startsWith('Bearer ')
+    ? String(provided).slice('Bearer '.length)
+    : String(provided);
+
+  if (token !== expected) return { ok: false, status: 403, message: 'Invalid API key' };
+
+  return { ok: true };
+}
+
+function buildRuleFromRequest(body = {}) {
+  // Prefer request body, fallback to env vars (so scheduler can just call /book with {})
+  return {
+    targetDay: body.targetDay ?? process.env.TARGET_DAY ?? 'Wednesday',
+    eveningStart: body.eveningStart ?? process.env.EVENING_START ?? '17:00',
+    eveningEnd: body.eveningEnd ?? process.env.EVENING_END ?? '21:00',
+    timeZone: body.timeZone ?? process.env.LOCAL_TZ ?? 'America/Toronto',
+    activityUrl: body.activityUrl ?? process.env.ACTIVITY_URL,
+    dryRun: body.dryRun ?? false,
+
+    // Optional tuning
+    browserlessHttpBase: body.browserlessHttpBase ?? process.env.BROWSERLESS_HTTP_BASE,
+    browserlessToken: body.browserlessToken ?? process.env.BROWSERLESS_TOKEN,
+
+    // Browserless timeout controls (strings in env → convert to int when using)
+    overallTimeoutMs: Number(body.overallTimeoutMs ?? process.env.BROWSERLESS_OVERALL_TIMEOUT_MS ?? 540000),
+    perAttemptTimeoutMs: Number(body.perAttemptTimeoutMs ?? process.env.BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS ?? 180000),
+    maxAttempts: Number(body.maxAttempts ?? process.env.BROWSERLESS_MAX_ATTEMPTS ?? 3),
+
+    // Amilia account
+    amiliaEmail: body.amiliaEmail ?? process.env.AMILIA_EMAIL,
+    amiliaPassword: body.amiliaPassword ?? process.env.AMILIA_PASSWORD,
+
+    // Session config (if you use it)
+    sessionStore: body.sessionStore ?? process.env.SESSION_STORE ?? 'firestore',
+    firestoreSessionDoc: body.firestoreSessionDoc ?? process.env.FIRESTORE_SESSION_DOC ?? 'amilia/session',
+
+    // Optional user info
+    playerName: body.playerName ?? process.env.PLAYER_NAME,
+    addressFull: body.addressFull ?? process.env.ADDRESS_FULL,
   };
+}
 
-  console.log("BOOK_START", JSON.stringify({ rule }));
+// ---------- routes ----------
 
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    Number(BROWSERLESS_OVERALL_TIMEOUT_MS)
+// Root: quick “is the service alive?”
+app.get('/', (req, res) => {
+  res.status(200).send('OK');
+});
+
+// Health: your curl should return 200 now
+app.get('/health', (req, res) => {
+  res.status(200).json({ ok: true, status: 'healthy' });
+});
+
+// Scheduler endpoint
+app.post('/book', async (req, res) => {
+  const auth = requireApiKey(req);
+  if (!auth.ok) {
+    return res.status(auth.status).json({ ok: false, error: auth.message });
+  }
+
+  const rule = buildRuleFromRequest(req.body);
+
+  // Basic validation so failures are obvious
+  if (!rule.activityUrl) {
+    return res.status(400).json({ ok: false, error: 'Missing activityUrl (ACTIVITY_URL env var or request body)' });
+  }
+  if (!rule.browserlessHttpBase || !rule.browserlessToken) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Missing Browserless config (BROWSERLESS_HTTP_BASE / BROWSERLESS_TOKEN)',
+    });
+  }
+  if (!rule.amiliaEmail || !rule.amiliaPassword) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Missing Amilia credentials (AMILIA_EMAIL / AMILIA_PASSWORD)',
+    });
+  }
+
+  console.log(
+    JSON.stringify({
+      severity: 'INFO',
+      msg: 'BOOK_START',
+      rule: {
+        targetDay: rule.targetDay,
+        eveningStart: rule.eveningStart,
+        eveningEnd: rule.eveningEnd,
+        timeZone: rule.timeZone,
+        dryRun: rule.dryRun,
+        activityUrl: rule.activityUrl,
+        maxAttempts: rule.maxAttempts,
+        perAttemptTimeoutMs: rule.perAttemptTimeoutMs,
+        overallTimeoutMs: rule.overallTimeoutMs,
+      },
+    })
   );
 
-  let attempts = 0;
-  let lastError = null;
-
   try {
-    while (attempts < Number(BROWSERLESS_MAX_ATTEMPTS)) {
-      attempts++;
+    const result = await runBooking(rule);
 
-      try {
-        const resp = await fetch(
-          `${BROWSERLESS_HTTP_BASE}/function?token=${BROWSERLESS_TOKEN}`,
-          {
-            method: "POST",
-            signal: controller.signal,
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              code: "// puppeteer code runs server-side",
-              context: {
-                EMAIL: AMILIA_EMAIL,
-                PASSWORD: AMILIA_PASSWORD,
-                ...rule,
-              },
-            }),
-            timeout: Number(BROWSERLESS_PER_ATTEMPT_TIMEOUT_MS),
-          }
-        );
+    console.log(JSON.stringify({ severity: 'INFO', msg: 'BOOK_DONE', resultSummary: result?.summary ?? null }));
 
-        const text = await resp.text();
-
-        if (!resp.ok) {
-          lastError = text;
-          console.warn("BROWSERLESS_NON_200", resp.status);
-          continue;
-        }
-
-        // SUCCESS PATH
-        return res.status(200).json({
-          ok: true,
-          status: "BROWSERLESS_OK",
-          attempts,
-          rule,
-          browserless: text,
-        });
-      } catch (err) {
-        lastError = err.message;
-        console.warn("BROWSERLESS_ATTEMPT_FAILED", {
-          attempt: attempts,
-          error: err.message,
-        });
-      }
-    }
-
-    // TIMEOUT / NO SLOT FOUND
     return res.status(200).json({
       ok: true,
-      status: "BROWSERLESS_TIMEOUT",
-      attempts,
-      rule,
-      message: "No slot yet, retrying on next schedule",
-      lastError,
+      result,
     });
   } catch (err) {
+    const status = err?.httpStatus || err?.status || 500;
+
+    console.error(
+      JSON.stringify({
+        severity: 'ERROR',
+        msg: 'BOOK_FAIL',
+        error: err?.message ?? String(err),
+        stack: err?.stack ?? null,
+        httpStatus: status,
+      })
+    );
+
     return res.status(200).json({
-      ok: true,
-      status: "BROWSERLESS_FATAL",
-      message: err.message,
+      ok: false,
+      status: err?.status ?? 'UNKNOWN_ERROR',
+      httpStatus: status,
+      message: err?.message ?? 'Booking failed',
     });
-  } finally {
-    clearTimeout(timeout);
   }
 });
 
-/* =========================
-   SERVER START
-   ========================= */
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+// ---------- booking implementation ----------
+// Replace ONLY the body of this function with your existing booking logic.
+// Keep the function signature and thrown errors consistent.
+async function runBooking(rule) {
+  // ✅ If you already have code that calls Browserless/Puppeteer and books on Amilia,
+  // paste it here.
+
+  // Example placeholder behavior:
+  if (rule.dryRun) {
+    return {
+      summary: 'dryRun: no booking attempted',
+      rule,
+    };
+  }
+
+  // If you want “fail fast” until real code is pasted in:
+  const e = new Error('Booking logic not implemented in this template. Paste your existing booking code into runBooking(rule).');
+  e.status = 'NOT_IMPLEMENTED';
+  e.httpStatus = 500;
+  throw e;
+}
+
+// ---------- start server ----------
+const PORT = Number(process.env.PORT || 8080);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(JSON.stringify({ severity: 'INFO', msg: 'server_started', port: PORT }));
 });
